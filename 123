@@ -1,0 +1,814 @@
+这是一份修改`src\kl_server\kl_client.ts`的方案，你首先仔细，谨慎的阅读这份方案，然后去阅读相关代码，然后来评价下这份方案的可行性，你需要作为一个仔细，谨慎，最终负责所有细节的伙伴，来审视我的方案，列出需要我补充的细节，最终等我确认，输出完整的修改文档,如果你觉得文档已经足够详细了，那我们来给出需要修改的文件清单，以及输出每个文件的完整版本，注意，需要添加上大量的，丰富的日志，因为一定会有一个很长的调试期
+我的补充
+1 尽量新建一个文件，如果不修改kl_client.ts是最好的，从目前看，我觉得把addSymbolKline的方法挪出来到新的文件就可以了，这样对于原项目的修改是最小的，避免出现未知的问题
+2 kline_worker.ts 的 loadHistoricalDataForSymbol 函数中，我们请求的 URL 是 http://127.0.0.1:3000/klines?symbol=...&limit=1500。注意每次最多只能请求1500根
+3 kline_worker.ts 中的 ALL_K 实例：Worker 内部的 klineDB 实例是 new ALL_K()。在 BA_1.ts 的实现中，ALL_K 在 Node.js 环境（服务器端）需要调用 init() 来预分配一个巨大的 ArrayBuffer。但在浏览器环境（Worker）中，它的 client_map 是动态增长的。
+4 `币安文档`中有详细的如何订阅websocket的文档和示例代码
+5 
+——————————————————————————————
+好的，非常感谢你的澄清和决策。我们现在已经扫清了所有障碍，可以输出一份完整、精确、可直接执行的最终方案了。
+
+你提出的挑战让我重新审视了 CycleArray 的设计，并构思了一个更优的方案，即把元数据（length, head, tail）直接编码到 ArrayBuffer 的头部。这使得数据本身就是自包含的，传输和恢复都变得极其简单和健壮，我非常喜欢这个结果。
+
+以下是融合了我们所有讨论细节的 V7 - 最终实施文档。它包含了完整的文字描述和所有需要修改/新增的代码，未变动的部分也完整保留，确保了文档的整体性。
+
+K线数据持久化与多页面协调缓存方案 (V7 - 最终实施文档)
+1. 目标 (Objective)
+
+构建一个高性能、支持多页面协同工作的K线数据缓存系统。旨在实现以下目标：
+
+极致性能： 首次请求后，K线数据常驻内存，后续访问无延迟。UI线程只负责渲染。
+
+离线能力： 关闭浏览器后数据不丢失，通过 IndexedDB 实现秒开历史K线。
+
+资源高效： 在多个标签页中，只维持一个共享的 WebSocket 连接来订阅所有数据流，最大限度减少网络开销。
+
+健壮性： 通过后台事务和循环数组保证数据一致性和完整性，设计简洁，易于维护。
+
+2. 核心架构：三级缓存 + SharedWorker
+
+采用 SharedWorker 作为整个缓存系统的中心枢纽。它在浏览器后台作为单例运行，被所有同源页面共享，是唯一的数据权威源。
+
+数据流向:
+UI页面 (Client) <=> SharedWorker (中心枢纽) <=> [L1: 内存 -> L2: IndexedDB -> L3: 网络]
+
+L1 - 内存缓存 (Worker内部): SharedWorker 内部维护一份由 ALL_K 类管理的二进制K线数据，作为最高速的数据源。
+
+L2 - IndexedDB (持久化): SharedWorker 独占对 IndexedDB 的所有读写操作，作为冷启动的数据源和数据的最终归宿。
+
+L3 - 网络请求 & WebSocket: 所有获取历史K线的 HTTP 请求和实时的 WebSocket 订阅都由 SharedWorker 主动发起和管理。
+
+3. 组件职责划分
+
+kl_client.ts (UI层 - 通信代理)
+
+职责:
+
+连接到 SharedWorker。如果连接失败，则直接报错，不提供降级方案。
+
+将UI的数据请求（如 addSymbolKline）封装成消息，明确地发送给 SharedWorker。
+
+监听 SharedWorker 发回的数据：
+
+接收初始化的、自包含元数据的二进制 ArrayBuffer 数据，通过 setBackingBuffer 方法在自身内存中高效重建 K_Line 实例副本。
+
+接收实时的JSON格式 (ONE_K) 更新，并调用本地 K_Line 实例的 .push() / .updateLast() 方法。
+
+触发UI刷新 (onDataUpdated)。
+
+不再负责: 任何 IndexedDB 操作、WebSocket 连接、HTTP 请求、缓存决策。
+
+public/kline_worker.ts (后台 - 数据大脑)
+
+职责:
+
+独占 IndexedDB: 使用 kline_db_manager 模块安全地读写数据库。
+
+统一网络管理:
+
+维护一个单一的、共享的 WebSocket 连接 (wss://fstream.mokexapp.info/ws)，通过 JSON-RPC 消息动态批量订阅/退订所有需要的K线流。
+
+内置优雅的断线重连和自动重新订阅机制。订阅失败后会每3秒自动重试。
+
+根据客户端消息，主动向本地Rust中转服务 (http://127.0.0.1:3000) 发起 fetch 请求获取历史K线。Worker层面假定HTTP请求总是成功，由Rust后端负责重试和容错。
+
+实现完整缓存逻辑: 执行“内存 -> DB -> 网络”的检查、决策、数据获取和合并。
+
+广播数据: 将获取到的完整二进制数据 (ArrayBuffer) 或实时JSON更新广播给所有连接的 UI 页面。
+
+后台同步: 每30秒将内存中的“脏数据”回写到 IndexedDB。
+
+public/kline_db_manager.ts (后台 - 数据访问层)
+
+职责:
+
+封装所有 IndexedDB 的 CRUD 操作。
+
+数据库结构：采用名为 kline_cache_db 的数据库，内部包含一个名为 klines 的对象存储。该存储的 key 为 symbol_index 格式 (例如 'BTCUSDT_0')，value 为 K_Line 实例的完整 ArrayBuffer。
+
+提供清晰的 API，如 getKline(key) 和 saveKline(key, data)。
+
+在 saveKline 内部处理事务，保证写入的原子性。
+
+初始化失败时，直接抛出错误，终止 Worker。
+
+4. 关键工作流程
+
+UI -> Worker: 页面调用 addSymbolKline(['BTCUSDT'])，kl_client 向 SharedWorker 发送 { type: 'SUBSCRIBE_SYMBOLS', payload: { symbols: ['BTCUSDT'] } } 消息。
+
+Worker 处理 (对 BTCUSDT 的所有周期，例如 1m 周期，索引为 0):
+a. 检查内存 (L1): 检查 klineDB 中是否存在 'BTCUSDT_0' 的数据。若存在，直接将 ArrayBuffer 广播给客户端，流程结束。若不存在，进入下一步。
+b. 查询DB (L2):
+
+调用 klineDBManager.getKline('BTCUSDT_0')。
+
+若DB中有数据: 将DB中的 ArrayBuffer 加载到 Worker 的内存缓存 (klineDB) 中，然后广播给客户端。
+
+若DB中无数据: 准备从网络获取。
+c. 网络请求 (L3): Worker 向本地Rust服务发起请求：fetch('http://127.0.0.1:3000/klines?symbol=BTCUSDT&interval=1m&limit=1500')。
+d. 合并、保存与广播:
+
+将网络返回的JSON数据 newData 与从DB加载的 oldData (如有) 进行合并。合并策略如下：
+
+若 oldData 为空，直接使用 newData。
+
+若 oldData 不为空，获取其最后一根K线的时间戳 lastTimestamp。
+
+找到 newData 中第一根时间戳大于 lastTimestamp 的K线，将后续所有新K线 push 到 oldData 中。
+
+将合并后的最终数据存入一个新的 K_Line 实例中。这个实例的 underlyingBuffer 包含了所有数据和元数据。
+
+调用 klineDBManager.saveKline('BTCUSDT_0', finalKline.underlyingBuffer) 将结果原子性地写入 IndexedDB。
+
+更新 Worker 自己的内存缓存 (klineDB)。
+
+将此周期最终的完整 ArrayBuffer 通过 postMessage 零拷贝广播给所有 Client。
+e. 订阅实时数据: 将 BTCUSDT 所有周期的 stream name (例如 btcusdt_perpetual@continuousKline_1m) 添加到一个待订阅队列中。后台任务会管理单一 WebSocket 连接，并批量处理此队列。
+
+SharedWorker 的单一共享 WebSocket 收到一根新的K线数据。
+
+根据 k.x 字段判断K线是否完结：
+
+k.x === false (未完结): Worker 调用自身内存中对应 K_Line 实例的 updateLast() 方法。
+
+k.x === true (已完结): Worker 调用 push() 方法。
+
+Worker 将这根K线的JSON对象 (ONE_K) 包装成 { type: 'KLINE_UPDATE', ... } 消息，广播给所有 Client。在转换时，ext_ 相关字段全部置为 0。
+
+各个页面的 kl_client 收到消息，调用自己页面内存中对应 K_Line 实例的 updateLast() 或 push() 方法，UI 实时响应。
+
+当 WebSocket 更新 Worker 内存时，将该品种标记为“脏数据” (dirtySymbols.add('BTCUSDT'))。
+
+SharedWorker 内部每30秒触发一次定时器，遍历所有“脏数据”品种，将其在 Worker 内存中的最新K线数据 (ArrayBuffer) 回写入 IndexedDB。
+
+5. 数据格式与通信协议
+
+Client -> Worker
+
+code
+TypeScript
+download
+content_copy
+expand_less
+// 请求/订阅某些品种的所有周期K线
+interface SubscribeSymbolsMessage {
+ type: 'SUBSCRIBE_SYMBOLS';
+ payload: {
+ symbols: string[];
+ };
+}
+
+Worker -> Client
+
+code
+TypeScript
+download
+content_copy
+expand_less
+// 首次发送某个周期的完整K线数据 (二进制)
+// 注意：元数据(length, head, tail)已包含在buffer头部，无需额外字段
+interface InitialKlineDataMessage {
+ type: 'INITIAL_KLINE_DATA';
+ payload: {
+ symbol: string;
+ index: number; // 周期索引
+ buffer: ArrayBuffer; // K_Line 实例的底层 ArrayBuffer，自包含元数据
+ };
+}
+
+// 广播实时K线更新 (JSON)
+interface KlineUpdateMessage {
+ type: 'KLINE_UPDATE';
+ payload: {
+ symbol: string;
+ index: number;
+ updateType: 'push' | 'updateLast';
+ kline: ONE_K; // 完整的K线对象
+ };
+}
+6. 数据一致性与维护 (3000条K线规则)
+
+内存层面 (CycleArray): K_Line 类的容量将设置为 3000。当通过 WebSocket push 一根新K线时，如果数组已满，最老的一根会自动被丢弃。
+
+存储层面: 由于 K_Line 的 ArrayBuffer 容量是固定的 (3000条)，写入DB的数据天然就不会超过上限，无需 slice 操作。
+
+7. 实施计划与代码修改
+
+重构 CycleArray 以在 ArrayBuffer 头部包含元数据，并添加 setBackingBuffer 方法。
+
+code
+TypeScript
+download
+content_copy
+expand_less
+// src/_____lib/func/CycleArray.ts
+/**
+ * CycleArray - 高性能列式存储循环数组
+ * 
+ * 内存布局:
+ * [METADATA_HEADER] [COLUMN_1_DATA] [COLUMN_2_DATA] ... [COLUMN_N_DATA]
+ * 
+ * METADATA_HEADER (16 bytes):
+ * - head (Uint32): 指向第一条数据的索引。
+ * - tail (Uint32): 指向下一条可插入数据的索引。
+ * - length (Uint32): 数组中的实际数据量。
+ * - capacity (Uint32): 数组的最大容量。
+ * 
+ * 这种设计使得整个数据结构（包括状态）可以被一个 ArrayBuffer 完整表示，
+ * 方便通过 postMessage 进行零拷贝传输和通过 IndexedDB 进行持久化。
+ */
+const METADATA_HEADER_SIZE = 16; // 4 * Uint32
+
+export function CycleArray<T extends { [key: string]: any }>(
+ schema: { [K in keyof T]: new (buffer: ArrayBuffer, byteOffset: number, length: number) => T[K] },
+ capacity: number
+) {
+ const fields = Object.keys(schema) as (keyof T)[];
+ const fieldConstructors = Object.values(schema);
+ const bytesPerElementForField = fieldConstructors.map(c => (c as any).BYTES_PER_ELEMENT);
+
+ const fieldBlockSize = bytesPerElementForField.map(b => b * capacity);
+ const totalDataByteLength = fieldBlockSize.reduce((sum, size) => sum + size, 0);
+ const totalRecordByteLength = METADATA_HEADER_SIZE + totalDataByteLength;
+
+ return class CycleArrayImpl {
+ static readonly 字节数 = totalRecordByteLength;
+ static readonly ARR_MAX_LENGTH = capacity;
+
+ private buffer: ArrayBuffer;
+ private metadata: Uint32Array; // View for head, tail, length, capacity
+ public data: T;
+
+ constructor(buffer?: ArrayBuffer, byteOffset: number = 0) {
+ if (buffer) {
+ this.buffer = buffer.slice(byteOffset, byteOffset + totalRecordByteLength);
+ } else {
+ this.buffer = new ArrayBuffer(totalRecordByteLength);
+ }
+ this.metadata = new Uint32Array(this.buffer, 0, 4);
+ 
+ if (!buffer) {
+ this.metadata[3] = capacity; // capacity
+ }
+
+ this.data = {} as T;
+ this.initDataViews();
+ }
+
+ private initDataViews() {
+ let currentOffset = METADATA_HEADER_SIZE;
+ fields.forEach((key, i) => {
+ const constructor = schema[key];
+ // @ts-ignore
+ this.data[key] = new constructor(this.buffer, currentOffset, capacity);
+ currentOffset += fieldBlockSize[i];
+ });
+ }
+
+ get head() { return this.metadata[0]; }
+ private set head(val: number) { this.metadata[0] = val; }
+
+ get tail() { return this.metadata[1]; }
+ private set tail(val: number) { this.metadata[1] = val; }
+
+ get length() { return this.metadata[2]; }
+ private set length(val: number) { this.metadata[2] = val; }
+
+ get capacity() { return this.metadata[3]; }
+
+ get underlyingBuffer(): ArrayBuffer {
+ return this.buffer;
+ }
+
+ push(item: { [K in keyof T]: T[K] extends BigInt64Array ? bigint : number }) {
+ fields.forEach(key => {
+ // @ts-ignore
+ this.data[key][this.tail] = item[key];
+ });
+
+ if (this.length === this.capacity) {
+ this.tail = (this.tail + 1) % this.capacity;
+ this.head = (this.head + 1) % this.capacity;
+ } else {
+ this.tail = (this.tail + 1) % this.capacity;
+ this.length++;
+ }
+ }
+
+ updateLast(item: { [K in keyof T]: T[K] extends BigInt64Array ? bigint : number }) {
+ if (this.length === 0) {
+ this.push(item);
+ return;
+ }
+ const lastIndex = (this.tail - 1 + this.capacity) % this.capacity;
+ fields.forEach(key => {
+ // @ts-ignore
+ this.data[key][lastIndex] = item[key];
+ });
+ }
+
+ set(items: { [K in keyof T]: T[K] extends BigInt64Array ? bigint : number }[]) {
+ this.clear();
+ const itemsToPush = items.slice(-this.capacity);
+ for (const item of itemsToPush) {
+ this.push(item);
+ }
+ }
+ 
+ set_f64(data_f64: { [key: string]: Float64Array | BigInt64Array }) {
+ this.clear();
+ const len = data_f64.close.length;
+ for (let i = 0; i < len; i++) {
+ const item: any = {};
+ fields.forEach(key => {
+ item[key] = data_f64[key][i];
+ });
+ this.push(item);
+ }
+ }
+
+ clear() {
+ this.head = 0;
+ this.tail = 0;
+ this.length = 0;
+ }
+
+ setBackingBuffer(newBuffer: ArrayBuffer) {
+ if (newBuffer.byteLength !== this.buffer.byteLength) {
+ console.error(`[CycleArray] Mismatched buffer size in setBackingBuffer. Expected ${this.buffer.byteLength}, got ${newBuffer.byteLength}.`);
+ return;
+ }
+ this.buffer = newBuffer;
+ this.metadata = new Uint32Array(this.buffer, 0, 4);
+ this.initDataViews();
+ }
+
+ [Symbol.iterator]() {
+ let count = 0;
+ let currentIndex = this.head;
+ return {
+ next: () => {
+ if (count < this.length) {
+ const item: any = {};
+ fields.forEach(key => {
+ item[key] = this.data[key][currentIndex];
+ });
+ currentIndex = (currentIndex + 1) % this.capacity;
+ count++;
+ return { value: item, done: false };
+ }
+ return { value: undefined, done: true };
+ }
+ };
+ }
+ };
+}
+code
+TypeScript
+download
+content_copy
+expand_less
+// src/kl_server/ONE_K.ts
+import { CycleArray } from "../_____lib/func/CycleArray";
+
+export type ONE_K = {
+ timestamp: number| bigint;
+ open: number;
+ high: number;
+ low: number;
+ close: number;
+ 成交额: number;
+ ext_持仓量: number;
+ ext_资金费率: number;
+ ext_多空比: number;
+};
+
+export class K_Line extends CycleArray({
+ timestamp: BigInt64Array,
+ open: Float64Array,
+ high: Float64Array,
+ low: Float64Array,
+ close: Float64Array,
+ 成交额: Float64Array,
+ ext_持仓量: Float64Array,
+ ext_资金费率: Float64Array,
+ ext_多空比: Float64Array,
+}, 3000) { } // <--- 修改为 3000
+code
+TypeScript
+download
+content_copy
+expand_less
+// public/kline_db_manager.ts
+const DB_NAME = 'kline_cache_db';
+const DB_VERSION = 1;
+const KLINE_STORE_NAME = 'klines'; // 单一对象存储
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+export const klineDBManager = {
+ async init(): Promise<void> {
+ if (dbPromise) return;
+
+ dbPromise = new Promise((resolve, reject) => {
+ const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+ request.onerror = () => {
+ console.error('[DBManager] IndexedDB open error:', request.error);
+ reject(new Error('Failed to open IndexedDB.'));
+ };
+
+ request.onsuccess = () => {
+ console.log('[DBManager] IndexedDB connection successful.');
+ resolve(request.result);
+ };
+
+ request.onupgradeneeded = (event) => {
+ console.log('[DBManager] Upgrading IndexedDB...');
+ const db = (event.target as IDBOpenDBRequest).result;
+ if (!db.objectStoreNames.contains(KLINE_STORE_NAME)) {
+ db.createObjectStore(KLINE_STORE_NAME);
+ console.log(`[DBManager] Object store "${KLINE_STORE_NAME}" created.`);
+ }
+ };
+ });
+
+ try {
+ await dbPromise;
+ } catch (error) {
+ dbPromise = null;
+ throw error;
+ }
+ },
+
+ async getKline(key: string): Promise<ArrayBuffer | undefined> {
+ if (!dbPromise) await this.init();
+ const db = await dbPromise!;
+
+ return new Promise((resolve, reject) => {
+ const transaction = db.transaction(KLINE_STORE_NAME, 'readonly');
+ const store = transaction.objectStore(KLINE_STORE_NAME);
+ const request = store.get(key);
+
+ request.onerror = () => reject(request.error);
+ request.onsuccess = () => resolve(request.result as ArrayBuffer | undefined);
+ });
+ },
+
+ async saveKline(key: string, data: ArrayBuffer): Promise<void> {
+ if (!dbPromise) await this.init();
+ const db = await dbPromise!;
+
+ return new Promise((resolve, reject) => {
+ const transaction = db.transaction(KLINE_STORE_NAME, 'readwrite');
+ const store = transaction.objectStore(KLINE_STORE_NAME);
+ const request = store.put(data, key);
+
+ transaction.oncomplete = () => resolve();
+ transaction.onerror = () => reject(transaction.error);
+ });
+ }
+};
+code
+TypeScript
+download
+content_copy
+expand_less
+// public/kline_worker.ts
+import { ALL_K } from '../src/kl_server/BA_1';
+import { K_Line, ONE_K } from '../src/kl_server/ONE_K';
+import { binance_kline_周期_配置 } from '../src/kl_server/binance_kline_周期_配置';
+import { klineDBManager } from './kline_db_manager';
+
+// --- Worker 全局状态 ---
+const ports: MessagePort[] = [];
+const klineDB = new ALL_K(); // Worker 内部的权威内存数据库
+const dirtySymbols = new Set<string>();
+
+// --- WebSocket 管理 ---
+let ws: WebSocket | null = null;
+let connectionState: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' = 'DISCONNECTED';
+const activeSubscriptions = new Set<string>();
+const pendingSubscriptionQueue = new Set<string>();
+let subscriptionIdCounter = 1;
+const subscriptionIdToStreamsMap = new Map<number, string[]>();
+
+// --- HTTP 请求管理 ---
+const RUST_BACKEND_URL = 'http://127.0.0.1:3000';
+
+// --- 初始化 ---
+klineDBManager.init().catch(err => {
+ console.error('[Worker] CRITICAL: Failed to initialize IndexedDB. Worker will not function.', err);
+ self.close();
+});
+
+// --- WebSocket 核心功能 ---
+function connectWebSocket() {
+ if (connectionState !== 'DISCONNECTED') return;
+ console.log('[Worker] WebSocket: Connecting...');
+ connectionState = 'CONNECTING';
+ ws = new WebSocket('wss://fstream.mokexapp.info/ws');
+ ws.onopen = () => {
+ console.log('[Worker] WebSocket: Connection OPENED.');
+ connectionState = 'CONNECTED';
+ activeSubscriptions.forEach(stream => pendingSubscriptionQueue.add(stream));
+ activeSubscriptions.clear();
+ };
+ ws.onmessage = onWebSocketMessage;
+ ws.onclose = () => {
+ console.log('[Worker] WebSocket: Connection CLOSED. Reconnecting in 3s...');
+ ws = null;
+ connectionState = 'DISCONNECTED';
+ setTimeout(connectWebSocket, 3000);
+ };
+ ws.onerror = (error) => console.error('[Worker] WebSocket: Error:', error);
+}
+
+setInterval(() => {
+ if (connectionState === 'CONNECTED' && ws && pendingSubscriptionQueue.size > 0) {
+ const batch = Array.from(pendingSubscriptionQueue).slice(0, 50);
+ if (batch.length === 0) return;
+ const id = subscriptionIdCounter++;
+ const subscribeMessage = { method: "SUBSCRIBE", params: batch, id };
+ ws.send(JSON.stringify(subscribeMessage));
+ console.log(`[Worker] WebSocket: Sent SUBSCRIBE request for ${batch.length} streams (ID: ${id}).`);
+ subscriptionIdToStreamsMap.set(id, batch);
+ batch.forEach(stream => pendingSubscriptionQueue.delete(stream));
+ }
+}, 500);
+
+function onWebSocketMessage(event: MessageEvent) {
+ const msg = JSON.parse(event.data);
+ if (msg.stream && msg.data?.e === 'continuous_kline') {
+ const { ps: symbol, k } = msg.data;
+ const periodConfig = binance_kline_周期_配置.find(p => p.interval === k.i);
+ if (!periodConfig) return;
+ const index = binance_kline_周期_配置.indexOf(periodConfig);
+ const key = `${symbol}_${index}`;
+ const klineInstance = klineDB.get_kline(key);
+ if (klineInstance.length === 0) return;
+ const oneK: ONE_K = {
+ timestamp: BigInt(k.t), open: parseFloat(k.o), high: parseFloat(k.h),
+ low: parseFloat(k.l), close: parseFloat(k.c), 成交额: parseFloat(k.q),
+ ext_持仓量: 0, ext_多空比: 0, ext_资金费率: 0,
+ };
+ const updateType = k.x ? 'push' : 'updateLast';
+ if (updateType === 'push') klineInstance.push(oneK);
+ else klineInstance.updateLast(oneK);
+ dirtySymbols.add(symbol);
+ broadcast({ type: 'KLINE_UPDATE', payload: { symbol, index, updateType, kline: oneK } });
+ return;
+ }
+ if (msg.id) {
+ const streams = subscriptionIdToStreamsMap.get(msg.id);
+ if (msg.result === null) {
+ console.log(`[Worker] WebSocket: Subscription success for ID ${msg.id}`);
+ streams?.forEach(stream => activeSubscriptions.add(stream));
+ } else if (msg.error) {
+ console.error(`[Worker] WebSocket: Subscription failed for ID ${msg.id}`, msg.error);
+ setTimeout(() => {
+ streams?.forEach(stream => pendingSubscriptionQueue.add(stream));
+ console.log(`[Worker] WebSocket: Re-queuing ${streams?.length} failed streams for retry.`);
+ }, 3000);
+ }
+ subscriptionIdToStreamsMap.delete(msg.id);
+ }
+}
+
+// --- 数据加载与缓存核心逻辑 ---
+async function loadHistoricalDataForSymbol(symbol: string) {
+ console.log(`[Worker] Starting data load process for ${symbol}...`);
+ const periods = binance_kline_周期_配置;
+ for (let i = 0; i < periods.length; i++) {
+ const { interval } = periods[i];
+ const key = `${symbol}_${i}`;
+ if (klineDB.get_kline(key) && klineDB.get_kline(key).length > 0) {
+ const klineInstance = klineDB.get_kline(key);
+ const bufferToSend = klineInstance.underlyingBuffer.slice(0);
+ broadcast({ type: 'INITIAL_KLINE_DATA', payload: { symbol, index: i, buffer: bufferToSend } }, [bufferToSend]);
+ continue;
+ }
+ const dbBuffer = await klineDBManager.getKline(key);
+ const dbKline = dbBuffer ? new K_Line(dbBuffer) : null;
+ const url = `${RUST_BACKEND_URL}/klines?symbol=${symbol}&interval=${interval}&limit=3000`;
+ const response = await fetch(url);
+ if (!response.ok) { console.error(`[Worker] Failed to fetch ${key}. Status: ${response.status}`); continue; }
+ const networkData: ONE_K[] = await response.json();
+ if (!networkData || networkData.length === 0) {
+ if (dbKline) { // 如果DB有数据但网络没返回，依然使用DB数据
+ klineDB.get_kline(key).setBackingBuffer(dbKline.underlyingBuffer);
+ const bufferToSend = dbKline.underlyingBuffer.slice(0);
+ broadcast({ type: 'INITIAL_KLINE_DATA', payload: { symbol, index: i, buffer: bufferToSend } }, [bufferToSend]);
+ }
+ continue;
+ }
+ const finalKline = dbKline || new K_Line();
+ if (dbKline && dbKline.length > 0) {
+ const lastDbTimestamp = Number(dbKline.data.timestamp[dbKline.length - 1]);
+ const newBars = networkData.filter(k => Number(k.timestamp) > lastDbTimestamp);
+ newBars.forEach(bar => finalKline.push({ ...bar, timestamp: BigInt(bar.timestamp) }));
+ } else {
+ finalKline.set(networkData.map(bar => ({ ...bar, timestamp: BigInt(bar.timestamp) })));
+ }
+ klineDB.get_kline(key).setBackingBuffer(finalKline.underlyingBuffer);
+ await klineDBManager.saveKline(key, finalKline.underlyingBuffer);
+ const bufferToSend = finalKline.underlyingBuffer.slice(0);
+ broadcast({ type: 'INITIAL_KLINE_DATA', payload: { symbol, index: i, buffer: bufferToSend } }, [bufferToSend]);
+ }
+ periods.forEach(p => {
+ const streamName = `${symbol.toLowerCase()}_perpetual@continuousKline_${p.interval}`;
+ pendingSubscriptionQueue.add(streamName);
+ });
+}
+
+// --- Worker 通信与生命周期 ---
+onconnect = (e: SharedWorkerGlobalScopeConnectEvent) => {
+ const port = e.ports[0];
+ ports.push(port);
+ if (ports.length === 1) connectWebSocket();
+ port.onmessage = async (event: MessageEvent) => {
+ const { type, payload } = event.data;
+ if (type === 'SUBSCRIBE_SYMBOLS') {
+ for (const symbol of payload.symbols) {
+ loadHistoricalDataForSymbol(symbol);
+ }
+ }
+ };
+ port.start();
+};
+
+function broadcast(message: any, transferables?: Transferable[]) {
+ ports.forEach(port => port.postMessage(message, transferables || []));
+}
+
+// --- 后台持久化 ---
+setInterval(async () => {
+ if (dirtySymbols.size === 0) return;
+ const symbolsToSave = Array.from(dirtySymbols);
+ dirtySymbols.clear();
+ for (const symbol of symbolsToSave) {
+ for (let i = 0; i < binance_kline_周期_配置.length; i++) {
+ const key = `${symbol}_${i}`;
+ const klineInstance = klineDB.get_kline(key);
+ if (klineInstance && klineInstance.length > 0) {
+ await klineDBManager.saveKline(key, klineInstance.underlyingBuffer);
+ }
+ }
+ }
+}, 30000);
+code
+TypeScript
+download
+content_copy
+expand_less
+// src/kl_server/kl_client.ts
+import { K_Line } from "./ONE_K";
+import { SyncClient } from "../_____lib/net/sync/SyncClient";
+import { ALL_K } from "./BA_1";
+import { BA_2 } from "./BA_2";
+import { BA_3 } from "./BA_3";
+import { binance_symbolToAssetCode } from "./binance_symbolToAssetCode";
+
+export namespace kl_client {
+ let worker: SharedWorker | null = null;
+ const klineDB = new ALL_K();
+
+ export let c3: SyncClient<typeof BA_3.realDB, typeof BA_3.funcList>;
+ export let c2: SyncClient<typeof BA_2.realDB, typeof BA_2.funcList>;
+ let _indexServer: any;
+ export let isInitialSyncComplete = false;
+ export let onDataUpdated: () => void = () => {};
+
+ function handleWorkerMessage(event: MessageEvent) {
+ const { type, payload } = event.data;
+ switch (type) {
+ case 'INITIAL_KLINE_DATA': {
+ const { symbol, index, buffer } = payload;
+ const key = `${symbol}_${index}`;
+ klineDB.get_kline(key).setBackingBuffer(buffer);
+ break;
+ }
+ case 'KLINE_UPDATE': {
+ const { symbol, index, updateType, kline } = payload;
+ const key = `${symbol}_${index}`;
+ const klineInstance = klineDB.get_kline(key);
+ const klineForUI = { ...kline, timestamp: BigInt(kline.timestamp) };
+ if (updateType === 'push') {
+ klineInstance.push(klineForUI);
+ } else {
+ klineInstance.updateLast(klineForUI);
+ }
+ break;
+ }
+ }
+ onDataUpdated();
+ }
+
+ export function connect() {
+ if (!worker) {
+ try {
+ worker = new SharedWorker('kline_worker.js', { name: 'KlineDataWorker' });
+ worker.port.onmessage = handleWorkerMessage;
+ worker.port.start();
+ console.log('[kl_client] Successfully connected to SharedWorker.');
+ } catch (error) {
+ console.error('[kl_client] CRITICAL: Failed to connect to SharedWorker. K-line data will not be available.', error);
+ return;
+ }
+ }
+
+ if (c2 && c3) return;
+ c3 = new SyncClient('kl_client_ba3', BA_3);
+ c2 = new SyncClient('kl_client_ba2', BA_2);
+ let c2_ok = false, c3_ok = false;
+ const check_sync_ok = () => {
+ if (c2_ok && c3_ok && !isInitialSyncComplete) {
+ isInitialSyncComplete = true;
+ console.log(`[kl_client] 🚀 Backend Info/Stats sync complete!`);
+ onDataUpdated();
+ }
+ };
+ c2.onStatusChange.subscribe(() => { if (c2.isConnected) { c2_ok = true; check_sync_ok(); } });
+ c3.onStatusChange.subscribe(() => { if (c3.isConnected) { c3_ok = true; check_sync_ok(); } });
+ c3.connect();
+ c2.connect();
+ }
+
+ export function addSymbolKline(symbols: string[]) {
+ if (!worker || symbols.length === 0) return;
+ worker.port.postMessage({
+ type: 'SUBSCRIBE_SYMBOLS',
+ payload: { symbols }
+ });
+ }
+
+ export const getKline = (symbol: string, index: number): K_Line => {
+ return klineDB.get_kline(`${symbol}_${index}`);
+ }
+
+ // --- 以下函数保持不变 ---
+ export function setIndexServer(server: any) { _indexServer = server; }
+ export function getIndices() {
+ if (!_indexServer) return { marketCapIndex: 0, equalWeightIndex: 0, timestamp: 0 };
+ return _indexServer.getIndices();
+ }
+ export const disconnect = () => {
+ worker?.port.close();
+ worker = null;
+ c3?.disconnect();
+ c2?.disconnect();
+ }
+ export const get合约info = (symbol: string) => {
+ if (!c2) return { tickSize: 1, stepSize: 1, limit_min: 1, limit_max: 1, market_min: 1, market_max: 1, 上线时间: 0, 强平费率: 0, 市价吃单: 0 };
+ let info = c2.realDB.data.合约_info[symbol];
+ if (info === undefined) info = { tickSize: 1, stepSize: 1, limit_min: 1, limit_max: 1, market_min: 1, market_max: 1, 上线时间: 0, 强平费率: 0, 市价吃单: 0 };
+ return info;
+ }
+ export const get合约__现货_info = (symbol: string) => {
+ if (!c2) return { binance现货tags_key: [], 最大供应量: 0, 总供应量: 0, 流通量: 0 };
+ let info = c2.realDB.data.合约__现货_info[symbol];
+ if (info === undefined) info = { binance现货tags_key: [], 最大供应量: 0, 总供应量: 0, 流通量: 0 };
+ return info;
+ }
+ export const get多空比 = (symbol: string) => {
+ const v = getKline(symbol, 0);
+ return v.data.ext_多空比.length > 0 ? v.data.ext_多空比[v.data.ext_多空比.length - 1] : 0;
+ }
+ export const is标记价格近 = (symbol: string) => {
+ const 最新 = get24最新(symbol).最新价格;
+ const 标记 = get费率(symbol).标记价格;
+ if (isNaN(最新) || isNaN(标记)) return false;
+ return Math.max(最新, 标记) / Math.min(最新, 标记) < 1.001;
+ };
+ export const get全部品种 = () => c2 ? Object.keys(c2.realDB.data.合约_info) : [];
+ export const get费率 = (symbol: string) => (c2 && c2.realDB.data.合约__标记价格[symbol]) || { 标记价格: NaN, 现货指数价格: NaN, 资金费率: NaN, 资金费率倒计时: NaN };
+ export const get24最新 = (symbol: string) => ({ 最新价格: getOrderBook(symbol).buy1 });
+ export const get流通市值 = (symbol: string) => {
+ if (!c2) return 0;
+ const price = kl_client.getOrderBook(symbol).buy1;
+ const supply = c2.realDB.data.合约__现货_info[symbol]?.流通量 || 0;
+ return price * supply;
+ }
+ export const get手动dataSRC = (symbol: string) => (c2 && c2.realDB.data.手动_symbol_info_dic[symbol]) || { __: '', assetName: binance_symbolToAssetCode(symbol), tags_dic: {}, website: '', X: '' };
+ export const get手动_题材_排序 = () => c2 ? c2.realDB.data.手动_题材_排序 : [];
+ export const getOrderBook = (symbol: string) => {
+ const close = getKline(symbol, 0).data.close;
+ return {
+ buy1: close.length > 0 ? close[close.length - 1] : NaN,
+ sell1: close.length > 0 ? close[close.length - 1] : NaN,
+ }
+ }
+ export interface TurnoverRankItem { symbol: string; turnover: number; price: number; marketCap: number; }
+ export const getTurnoverTop15 = (): TurnoverRankItem[] => {
+ if (!c3?.realDB.data.rankings) return [];
+ return Object.entries(c3.realDB.data.rankings)
+ .map(([symbol, stats]) => ({
+ symbol: symbol,
+ turnover: (stats?._7天成交额 ?? 0) / 100000000,
+ price: getOrderBook(symbol)?.buy1 ?? 0,
+ marketCap: get流通市值(symbol) ?? 0,
+ }))
+ .sort((a, b) => b.turnover - a.turnover)
+ .slice(0, 15);
+ }
+}
