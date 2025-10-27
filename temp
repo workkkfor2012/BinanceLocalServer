@@ -1,3 +1,19 @@
+`src\kl_server\kl_client.ts`中，每次去请求，
+1 如果该品种该周期，内存中没有，也就是klineInstance.length = 0，那么就全量请求1500根
+2 如果klineInstance.length>0,应该先查看内存缓存中的K线,该周期最后1根的opentime，作为start time参数，传递到后端，增量读取
+3 该周期最后1根的opentime，计算下到当前时间(这里可能有时区的问题)，一共多少根，如果超过1500根，也就是历史数据太老了，那么就删除旧的该品种该周期的内存k线，然后重新全量请求
+
+我觉得主要代码是
+1 src\kl_server\kl_client.ts
+2 src\kl_server\BA_1.ts
+3 src\kl_server\ONE_K.ts
+4 src\_____lib\func\CycleArray.ts
+确认以下问题
+1 如何获得某个品种某个周期的K线，这是否获得的就是内存中二进制的k线数据
+2 如果是二进制的内存k线数据，如何获得该品种该周期的最后一根k线，并且读取出opentime？
+3 请求的增量数据，如何merge，现在的源码中是否有现成方法， klineInstance.set_f64(data_f64 as any);好像是全量覆盖对吗？
+
+
 {
     "orderId": 8389765995835764192,
     "symbol": "ETHUSDT",
