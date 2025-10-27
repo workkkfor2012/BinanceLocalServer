@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::sleep;
-use tracing::{info, trace, warn};
+use tracing::{info, trace, warn, instrument}; // 添加 instrument
 
 // Constants
 const MOKEX_BASE_URL: &str = "https://www.mokexapp.info";
@@ -37,12 +37,14 @@ impl ApiClient {
 
         let mokex_client = Client::builder()
             .default_headers(mokex_headers)
+            .timeout(Duration::from_secs(10)) // 添加超时，防止网络层永久卡死
             .build()
             .map_err(AppError::Reqwest)?;
 
         let proxy = reqwest::Proxy::all(PROXY_URL).map_err(AppError::Reqwest)?;
         let binance_client = Client::builder()
             .proxy(proxy)
+            .timeout(Duration::from_secs(10)) // 添加超时
             .build()
             .map_err(AppError::Reqwest)?;
 
@@ -53,11 +55,13 @@ impl ApiClient {
     }
 
     /// 使用 fallback 和 retry 逻辑下载K线
+    #[instrument(skip(self))]
     pub async fn download_continuous_klines(&self, task: &DownloadTask) -> Result<Vec<Kline>> {
         let start_time = Instant::now();
 
         // 1. 首先尝试 Mokex
-        trace!("Attempting primary source (Mokex) for task: {:?}", task);
+        // trace!("Attempting primary source (Mokex) for task: {:?}", task);
+        info!("🌐 [DEBUG_API] 尝试主线路 (Mokex): {}/{}", task.symbol, task.interval);
         let mokex_result = self
             .fetch_klines(&self.mokex_client, MOKEX_BASE_URL, task)
             .await;
@@ -65,26 +69,26 @@ impl ApiClient {
         match mokex_result {
             Ok(klines) => {
                 info!(
-                    "Fetched from Mokex in {:.2?}. Task: {:?}",
+                    "✅ [DEBUG_API] Mokex 成功 ({:.2?}). Task: {}/{}",
                     start_time.elapsed(),
-                    task
+                    task.symbol, task.interval
                 );
                 Ok(klines)
             }
             Err(e) => {
                 warn!(
-                    "Mokex request failed: {}. Falling back to Binance with retries.",
+                    "⚠️ [DEBUG_API] Mokex 失败: {}. 切换到 Binance 重试.",
                     e
                 );
                 
                 let mut last_error: Option<AppError> = None;
 
                 for attempt in 1..=FALLBACK_RETRIES {
-                    trace!(
-                        "Attempting Binance fallback {}/{} for task: {:?}",
+                    info!(
+                        "🔄 [DEBUG_API] Binance 重试 {}/{}: {}/{}",
                         attempt,
                         FALLBACK_RETRIES,
-                        task
+                        task.symbol, task.interval
                     );
 
                     match self
@@ -93,18 +97,16 @@ impl ApiClient {
                     {
                         Ok(klines) => {
                             info!(
-                                "Fetched from Binance (fallback attempt {}/{}) in {:.2?}. Task: {:?}",
+                                "✅ [DEBUG_API] Binance 成功 (第 {} 次) in {:.2?}.",
                                 attempt,
-                                FALLBACK_RETRIES,
-                                start_time.elapsed(),
-                                task
+                                start_time.elapsed()
                             );
                             return Ok(klines);
                         }
                         Err(retry_err) => {
                             warn!(
-                                "Binance fallback attempt {}/{} failed: {}",
-                                attempt, FALLBACK_RETRIES, retry_err
+                                "❌ [DEBUG_API] Binance 尝试 {} 失败: {}",
+                                attempt, retry_err
                             );
                             last_error = Some(retry_err);
 
@@ -116,8 +118,8 @@ impl ApiClient {
                 }
 
                 warn!(
-                    "All {} Binance fallback attempts failed for task {:?}",
-                    FALLBACK_RETRIES, task
+                    "⛔ [DEBUG_API] 所有重试均失败: {}/{}",
+                     task.symbol, task.interval
                 );
                 Err(last_error.unwrap())
             }
@@ -143,10 +145,13 @@ impl ApiClient {
         }
 
         let url = format!("{}/fapi/v1/continuousKlines?{}", base_url, url_params);
-        trace!("Downloading K-lines from URL: {}", url);
+        // trace!("Downloading K-lines from URL: {}", url);
 
+        info!("📡 [DEBUG_API_REQ] 发送 HTTP GET: {}...", &url[..min(url.len(), 60)]); // 只打印 URL 前面部分避免太长
         let response = client.get(&url).send().await?.error_for_status()?;
+        info!("📩 [DEBUG_API_REQ] 收到 HTTP 响应头 (准备读取 body)");
         let response_text = response.text().await?;
+        info!("📦 [DEBUG_API_REQ] 读取 body 完成 ({} bytes)", response_text.len());
 
         let raw_klines: Vec<Vec<Value>> = serde_json::from_str(&response_text)?;
 
@@ -164,4 +169,7 @@ impl ApiClient {
     }
 }
 
-// --- `interval_to_milliseconds` 函数已被移除 ---
+// 辅助函数：用于截断日志中的 URL
+fn min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}
