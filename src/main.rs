@@ -1,11 +1,14 @@
 // src/main.rs
 mod api_client;
+mod cache_manager;
 mod error;
 mod models;
 mod transformer;
+mod utils;
 mod web_server;
 
 use crate::api_client::ApiClient;
+use crate::cache_manager::CacheManager;
 use axum::{
     extract::Request,
     http::header,
@@ -79,8 +82,13 @@ async fn main() {
 
     info!("Starting K-line API proxy service...");
 
+    // 1. 初始化 ApiClient
     let api_client = Arc::new(ApiClient::new().expect("Failed to create API clients"));
     info!("API clients initialized.");
+
+    // 2. 初始化 CacheManager，并将 ApiClient 注入
+    let cache_manager = Arc::new(CacheManager::new(api_client));
+    info!("CacheManager initialized.");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -107,7 +115,7 @@ async fn main() {
             "/test-download-binary",
             get(web_server::test_download_binary_handler),
         )
-        .with_state(api_client)
+        .with_state(cache_manager)
         .layer(middleware::from_fn(log_requests))
         .layer(cors)
         .layer(PrivateNetworkAccessLayer);

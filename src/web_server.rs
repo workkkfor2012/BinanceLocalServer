@@ -1,11 +1,11 @@
 // src/web_server.rs
-use crate::api_client::ApiClient;
+use crate::cache_manager::CacheManager;
 use crate::error::Result;
 use crate::models::DownloadTask;
-use crate::transformer; // <-- 引入 transformer 模块
+use crate::transformer;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap}, // <-- 引入 HeaderMap
+    http::{header, HeaderMap},
     response::IntoResponse,
     Json,
 };
@@ -13,75 +13,53 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
-/// 定义用于接收查询参数的结构体
 #[derive(Debug, Deserialize)]
 pub struct KlineParams {
+    // 这些参数目前由缓存逻辑处理，但保留结构以备将来使用
     #[serde(rename = "startTime")]
-    pub start_time: Option<i64>,
+    pub _start_time: Option<i64>,
     #[serde(rename = "endTime")]
-    pub end_time: Option<i64>,
-    pub limit: Option<usize>,
+    pub _end_time: Option<i64>,
+    pub _limit: Option<usize>,
 }
 
 /// Axum Handler: 代理对K线API的请求 (返回 JSON)
-/// (此函数保持不变)
 pub async fn proxy_kline_handler(
-    State(api_client): State<Arc<ApiClient>>,
+    State(cache_manager): State<Arc<CacheManager>>,
     Path((symbol, interval)): Path<(String, String)>,
-    Query(params): Query<KlineParams>,
+    Query(_params): Query<KlineParams>, // params are ignored, cache manager handles logic
 ) -> Result<impl IntoResponse> {
-    info!(
-        "Received JSON request for {}/{} with params: {:?}",
-        symbol, interval, params
-    );
+    info!("Received JSON request for {}/{}", symbol, interval);
 
-    let task = DownloadTask {
-        symbol,
-        interval,
-        start_time: params.start_time,
-        end_time: params.end_time,
-        limit: params.limit.unwrap_or(500),
-    };
+    let klines = cache_manager.get_klines(&symbol, &interval).await?;
 
-    let klines = api_client.download_continuous_klines(&task).await?;
     info!(
-        "Responding with {} k-lines for JSON task: {:?}",
+        "Responding with {} k-lines for JSON request: {}/{}",
         klines.len(),
-        task
+        symbol,
+        interval
     );
 
     Ok(Json(klines))
 }
 
 /// Axum Handler: 获取K线数据并以二进制格式返回
-/// e.g., GET /download-binary/BTCUSDT/5m?limit=2000
 pub async fn binary_kline_handler(
-    State(api_client): State<Arc<ApiClient>>,
+    State(cache_manager): State<Arc<CacheManager>>,
     Path((symbol, interval)): Path<(String, String)>,
-    Query(params): Query<KlineParams>,
+    Query(_params): Query<KlineParams>,
 ) -> Result<impl IntoResponse> {
-    info!(
-        "Received BINARY request for {}/{} with params: {:?}",
-        symbol, interval, params
-    );
-    
-    // 规范要求默认 2000, 且最大容量也是 2000
-    let limit = params.limit.unwrap_or(2000).min(2000);
+    info!("Received BINARY request for {}/{}", symbol, interval);
 
-    let task = DownloadTask {
-        symbol: symbol.clone(), 
-        interval: interval.clone(),
-        start_time: params.start_time,
-        end_time: params.end_time,
-        limit,
-    };
-
-    let klines = api_client.download_continuous_klines(&task).await?;
+    let klines = cache_manager
+        .get_klines(&symbol, &interval)
+        .await?;
 
     info!(
-        "Transforming {} k-lines to binary format for task: {:?}",
+        "Transforming {} k-lines to binary format for: {}/{}",
         klines.len(),
-        task
+        symbol,
+        interval
     );
     let binary_blob = transformer::klines_to_binary_blob(&klines, &symbol, &interval)?;
 
@@ -94,10 +72,11 @@ pub async fn binary_kline_handler(
     Ok((headers, binary_blob))
 }
 
+// --- 测试端点现在从 CacheManager 中获取 ApiClient ---
+
 /// Axum Handler: 一个简单的测试端点 (JSON)
-/// e.g., GET /test-download
 pub async fn test_download_handler(
-    State(api_client): State<Arc<ApiClient>>,
+    State(cache_manager): State<Arc<CacheManager>>,
 ) -> Result<impl IntoResponse> {
     info!("Received test download request for BTCUSDT/1m limit=5");
 
@@ -109,7 +88,11 @@ pub async fn test_download_handler(
         limit: 5,
     };
 
-    let klines = api_client.download_continuous_klines(&task).await?;
+    // 直接使用 cache_manager 内部的 api_client，绕过缓存
+    let klines = cache_manager
+        .api_client
+        .download_continuous_klines(&task)
+        .await?;
     info!(
         "Test download successful, responding with {} k-lines.",
         klines.len()
@@ -118,15 +101,14 @@ pub async fn test_download_handler(
     Ok(Json(klines))
 }
 
-/// 【新增】Axum Handler: 一个简单的测试端点，用于下载二进制 K 线
-/// e.g., GET /test-download-binary
+/// Axum Handler: 一个简单的测试端点，用于下载二进制 K 线
 pub async fn test_download_binary_handler(
-    State(api_client): State<Arc<ApiClient>>,
+    State(cache_manager): State<Arc<CacheManager>>,
 ) -> Result<impl IntoResponse> {
     info!("Received test BINARY download request for BTCUSDT/5m limit=5");
 
     let symbol = "BTCUSDT".to_string();
-    let interval = "5m".to_string(); // 使用一个二进制格式支持的周期
+    let interval = "5m".to_string();
 
     let task = DownloadTask {
         symbol: symbol.clone(),
@@ -136,17 +118,17 @@ pub async fn test_download_binary_handler(
         limit: 5,
     };
 
-    // 1. 获取K线数据
-    let klines = api_client.download_continuous_klines(&task).await?;
+    let klines = cache_manager
+        .api_client
+        .download_continuous_klines(&task)
+        .await?;
 
-    // 2. 转换为二进制
     info!(
         "Test binary transform successful with {} k-lines. Responding with binary blob.",
         klines.len()
     );
     let binary_blob = transformer::klines_to_binary_blob(&klines, &symbol, &interval)?;
 
-    // 3. 构造二进制响应
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
