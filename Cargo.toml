@@ -30,3 +30,7 @@ dashmap = "6.1.0" # <-- 新增
 thiserror = "2.0.17"
 chrono = "0.4.42"
 once_cell = "1.21.3"
+
+# --- 数据库 ---
+tokio-rusqlite = "0.6.0"
+rusqlite = { version = "0.32.0", features = ["bundled", "chrono"] }

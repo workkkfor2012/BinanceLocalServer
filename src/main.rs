@@ -1,6 +1,7 @@
 // src/main.rs
 mod api_client;
 mod cache_manager;
+mod db_manager;
 mod error;
 mod models;
 mod transformer;
@@ -8,7 +9,8 @@ mod utils;
 mod web_server;
 
 use crate::api_client::ApiClient;
-use crate::cache_manager::CacheManager;
+use crate::cache_manager::{CacheManager, KLINE_CACHE_LIMIT};
+use crate::db_manager::DbManager;
 use axum::{
     extract::Request,
     http::header,
@@ -22,9 +24,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::{Layer, Service};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{error, info};
 
-/// 一个简单的中间件，用于打印每个收到的请求URL
 async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -32,7 +33,6 @@ async fn log_requests(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-// --- 中间件用于添加 PNA 头部 (保持不变) ---
 #[derive(Clone)]
 struct PrivateNetworkAccessLayer;
 
@@ -82,13 +82,81 @@ async fn main() {
 
     info!("Starting K-line API proxy service...");
 
-    // 1. 初始化 ApiClient
     let api_client = Arc::new(ApiClient::new().expect("Failed to create API clients"));
     info!("API clients initialized.");
 
-    // 2. 初始化 CacheManager，并将 ApiClient 注入
-    let cache_manager = Arc::new(CacheManager::new(api_client));
-    info!("CacheManager initialized.");
+    let db_manager = Arc::new(DbManager::new().await.expect("Failed to initialize DbManager"));
+    info!("Database manager initialized.");
+
+    info!("--- 📊 Database Cache Summary ---");
+    match db_manager.get_db_summary().await {
+        Ok(summary) => {
+            if summary.is_empty() {
+                info!("   Database is empty. Cache will be built on first request.");
+            } else {
+                let mut sorted_symbols: Vec<_> = summary.keys().cloned().collect();
+                sorted_symbols.sort();
+
+                for symbol in sorted_symbols {
+                    if let Some(intervals) = summary.get(&symbol) {
+                        let mut sorted_intervals = intervals.clone();
+                        sorted_intervals.sort_by_key(|(interval_str, _)| {
+                            utils::interval_to_milliseconds(interval_str).unwrap_or(i64::MAX)
+                        });
+
+                        let parts: Vec<String> = sorted_intervals
+                            .iter()
+                            .map(|(interval, count)| format!("{}: {}", interval, count))
+                            .collect();
+                        
+                        info!("   - {:<15} | {}", symbol, parts.join(" | "));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("   Failed to get database summary: {}", e);
+        }
+    }
+    info!("------------------------------------");
+
+    info!("🔥 Starting cache pre-warming from database...");
+    let cache_manager = Arc::new(CacheManager::new(api_client.clone(), db_manager.clone()));
+    
+    let keys_to_warm = db_manager.get_all_cache_keys().await.unwrap_or_else(|e| {
+        error!("Failed to get cache keys from DB: {}", e);
+        vec![]
+    });
+
+    let total_keys = keys_to_warm.len();
+    info!("Found {} unique (symbol, interval) keys to warm.", total_keys);
+
+    for (i, (symbol, interval)) in keys_to_warm.into_iter().enumerate() {
+        // --- 【核心修改】 ---
+        match db_manager.get_latest_klines(&symbol, &interval, KLINE_CACHE_LIMIT).await {
+            Ok(klines) if !klines.is_empty() => {
+                // 在日志中加入 klines.len()
+                info!(
+                    "[{}/{}] Warming cache for {}/{}... ({} klines)",
+                    i + 1,
+                    total_keys,
+                    symbol,
+                    interval,
+                    klines.len()
+                );
+                cache_manager.warm_up(&symbol, &interval, klines);
+            }
+            Ok(_) => info!(
+                "[{}/{}] No data in DB for {}/{}, skipping.",
+                i + 1, total_keys, symbol, interval
+            ),
+            Err(e) => error!(
+                "[{}/{}] Failed to warm up cache for {}/{}: {}",
+                i + 1, total_keys, symbol, interval, e
+            ),
+        }
+    }
+    info!("✅ Cache pre-warming finished.");
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -100,7 +168,6 @@ async fn main() {
     info!("CORS middleware configured for PNA.");
 
     let app = Router::new()
-        // 【路由语法修正】使用 {param} 替代 :param
         .route(
             "/download/{symbol}/{interval}",
             get(web_server::proxy_kline_handler),
@@ -109,7 +176,6 @@ async fn main() {
             "/download-binary/{symbol}/{interval}",
             get(web_server::binary_kline_handler),
         )
-        // 测试接口 (无参数，不受影响)
         .route("/test-download", get(web_server::test_download_handler))
         .route(
             "/test-download-binary",
@@ -124,7 +190,6 @@ async fn main() {
     let listener = TcpListener::bind(addr).await.expect("Failed to bind");
     info!("🚀 Server listening on http://{}", addr);
     info!("🌐 Now accessible from public websites due to PNA headers.");
-
     info!("---");
     info!("👉 JSON Test endpoint:   curl http://{}/test-download", addr);
     info!(

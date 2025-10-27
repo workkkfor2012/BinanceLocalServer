@@ -1,1 +1,4 @@
 /target
+kline_cache.db
+kline_cache.db-shm
+kline_cache.db-wal
