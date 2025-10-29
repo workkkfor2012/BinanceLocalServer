@@ -133,6 +133,13 @@ impl ApiClient {
         base_url: &str,
         task: &DownloadTask,
     ) -> Result<Vec<Kline>> {
+        // --- 疑问与探讨点 ---
+        // 这里手动拼接 URL 字符串，如果 symbol 包含特殊字符（除了中文，还有像 &、= 等），
+        // 可能会导致 URL 解析错误。一个更健壮的做法是使用 reqwest 的查询参数构建器，
+        // 它会自动处理 URL 编码。例如：
+        // client.get(url)
+        //       .query(&[("pair", &task.symbol), ("interval", &task.interval), ...])
+        // 这样做会让代码更安全，不过当前 `format!` 的方式也能工作，因为 reqwest 内部会编码整个 URL。
         let mut url_params = format!(
             "pair={}&contractType=PERPETUAL&interval={}&limit={}",
             task.symbol, task.interval, task.limit
@@ -145,9 +152,11 @@ impl ApiClient {
         }
 
         let url = format!("{}/fapi/v1/continuousKlines?{}", base_url, url_params);
-        // trace!("Downloading K-lines from URL: {}", url);
 
-        info!("📡 [DEBUG_API_REQ] 发送 HTTP GET: {}...", &url[..min(url.len(), 60)]); // 只打印 URL 前面部分避免太长
+        // --- 【核心修复】 ---
+        // 移除了不安全的字符串切片 `&url[..60]`，直接打印完整的 URL。
+        // 这彻底解决了在多字节字符边界上 panic 的问题。
+        info!("📡 [DEBUG_API_REQ] 发送 HTTP GET: {}", &url);
         let response = client.get(&url).send().await?.error_for_status()?;
         info!("📩 [DEBUG_API_REQ] 收到 HTTP 响应头 (准备读取 body)");
         let response_text = response.text().await?;
@@ -167,9 +176,4 @@ impl ApiClient {
 
         Ok(klines)
     }
-}
-
-// 辅助函数：用于截断日志中的 URL
-fn min(a: usize, b: usize) -> usize {
-    if a < b { a } else { b }
 }
