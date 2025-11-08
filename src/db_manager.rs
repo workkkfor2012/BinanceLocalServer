@@ -1,7 +1,7 @@
 // src/db_manager.rs
 use crate::error::Result;
 use crate::models::Kline;
-use std::collections::HashMap; // <-- 新增
+use std::collections::HashMap;
 use tokio_rusqlite::{params, Connection};
 use tracing::info;
 
@@ -52,7 +52,6 @@ impl DbManager {
         Ok(Self { conn })
     }
 
-    // --- 新增摘要函数 ---
     /// 获取数据库内容的摘要信息，按 symbol 分组
     pub async fn get_db_summary(&self) -> Result<HashMap<String, Vec<(String, i64)>>> {
         let summary_data = self
@@ -77,6 +76,7 @@ impl DbManager {
         Ok(summary_data)
     }
     
+    // 这个函数在最终方案中不再被调用，但保留也无妨
     pub async fn get_all_cache_keys(&self) -> Result<Vec<(String, String)>> {
         let keys = self.conn.call(|conn| {
             let mut stmt = conn.prepare_cached(

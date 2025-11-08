@@ -16,6 +16,8 @@ futures = "0.3.31" # 用于自定义中间件中的 BoxFuture
 # --- 日志 ---
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+# 【关键】负责安全地按小时轮转文件，并提供非阻塞写入能力
+tracing-appender = "0.2.3" 
 
 # --- 序列化 / 反序列化 ---
 serde = { version = "1.0.228", features = ["derive"] }

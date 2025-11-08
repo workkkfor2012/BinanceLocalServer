@@ -1,6 +1,6 @@
 // src/main.rs
 mod api_client;
-mod cache_manager;
+mod cache_manager; // 名字可以不改，但职责变了
 mod db_manager;
 mod error;
 mod models;
@@ -9,7 +9,7 @@ mod utils;
 mod web_server;
 
 use crate::api_client::ApiClient;
-use crate::cache_manager::{CacheManager, KLINE_CACHE_LIMIT};
+use crate::cache_manager::CacheManager;
 use crate::db_manager::DbManager;
 use axum::{
     extract::Request,
@@ -20,22 +20,83 @@ use axum::{
     Router,
 };
 use futures::future::BoxFuture;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::time::{interval, Duration};
 use tower::{Layer, Service};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+// 日志清理任务等辅助函数保持不变...
+// ... (此处省略 spawn_log_cleanup_task, log_requests, PrivateNetworkAccessLayer 等代码)
+async fn spawn_log_cleanup_task() {
+    info!("🧹 日志清理服务已启动，将每小时检查一次旧日志。");
+    let mut interval = interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        info!("执行预定的日志清理任务...");
+        let result = tokio::task::spawn_blocking(move || {
+            let log_dir = Path::new("./");
+            let now = chrono::Local::now();
+            let cutoff = now - chrono::Duration::hours(12);
+            let mut deleted_count = 0;
+            let entries = match fs::read_dir(log_dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("读取日志目录失败: {}", e);
+                    return 0;
+                }
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |s| s.starts_with("start.log."))
+                {
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified_time) = metadata.modified() {
+                            let modified_time: chrono::DateTime<chrono::Local> =
+                                modified_time.into();
+                            if modified_time < cutoff {
+                                match fs::remove_file(&path) {
+                                    Ok(_) => {
+                                        info!("已删除旧日志文件: {:?}", path);
+                                        deleted_count += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!("删除旧日志文件 {:?} 失败: {}", path, e)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            deleted_count
+        })
+        .await;
+        match result {
+            Ok(count) if count > 0 => {
+                info!("日志清理完成，共删除了 {} 个旧日志文件。", count)
+            }
+            Ok(_) => info!("日志清理完成，没有需要删除的旧日志文件。"),
+            Err(e) => error!("日志清理任务 panic: {}", e),
+        }
+    }
+}
 async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    info!("⬅️ Received request: {} {}", method, uri);
+    info!("⬅️ 收到请求: {} {}", method, uri);
     next.run(req).await
 }
-
 #[derive(Clone)]
 struct PrivateNetworkAccessLayer;
-
 impl<S> Layer<S> for PrivateNetworkAccessLayer {
     type Service = PrivateNetworkAccessService<S>;
     fn layer(&self, inner: S) -> Self::Service {
@@ -74,90 +135,38 @@ where
     }
 }
 
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+    // 日志初始化...
+    let file_appender = tracing_appender::rolling::hourly("./", "start.log");
+    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(non_blocking_writer).with_ansi(false))
+        .with(fmt::layer().with_writer(std::io::stdout))
+        .with(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
+    info!("程序启动，日志系统已初始化。");
+    tokio::spawn(spawn_log_cleanup_task());
 
-    info!("Starting K-line API proxy service...");
-
+    // --- 1. 初始化依赖 ---
     let api_client = Arc::new(ApiClient::new().expect("Failed to create API clients"));
-    info!("API clients initialized.");
+    info!("API 客户端已初始化。");
 
     let db_manager = Arc::new(DbManager::new().await.expect("Failed to initialize DbManager"));
-    info!("Database manager initialized.");
+    info!("数据库管理器已初始化。");
 
-    info!("--- 📊 Database Cache Summary ---");
-    match db_manager.get_db_summary().await {
-        Ok(summary) => {
-            if summary.is_empty() {
-                info!("   Database is empty. Cache will be built on first request.");
-            } else {
-                let mut sorted_symbols: Vec<_> = summary.keys().cloned().collect();
-                sorted_symbols.sort();
-
-                for symbol in sorted_symbols {
-                    if let Some(intervals) = summary.get(&symbol) {
-                        let mut sorted_intervals = intervals.clone();
-                        sorted_intervals.sort_by_key(|(interval_str, _)| {
-                            utils::interval_to_milliseconds(interval_str).unwrap_or(i64::MAX)
-                        });
-
-                        let parts: Vec<String> = sorted_intervals
-                            .iter()
-                            .map(|(interval, count)| format!("{}: {}", interval, count))
-                            .collect();
-                        
-                        info!("   - {:<15} | {}", symbol, parts.join(" | "));
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            error!("   Failed to get database summary: {}", e);
-        }
-    }
-    info!("------------------------------------");
-
-    info!("🔥 Starting cache pre-warming from database...");
-    let cache_manager = Arc::new(CacheManager::new(api_client.clone(), db_manager.clone()));
+    // --- 2. 注入依赖 ---
+    let cache_manager = Arc::new(CacheManager::new(
+        api_client.clone(),
+        db_manager.clone(),
+    ));
+    info!("数据服务已准备就绪。");
     
-    let keys_to_warm = db_manager.get_all_cache_keys().await.unwrap_or_else(|e| {
-        error!("Failed to get cache keys from DB: {}", e);
-        vec![]
-    });
+    // --- 【核心】不再有任何预热逻辑 ---
+    info!("✅ 服务已准备就绪，无需预热。");
 
-    let total_keys = keys_to_warm.len();
-    info!("Found {} unique (symbol, interval) keys to warm.", total_keys);
-
-    for (i, (symbol, interval)) in keys_to_warm.into_iter().enumerate() {
-        // --- 【核心修改】 ---
-        match db_manager.get_latest_klines(&symbol, &interval, KLINE_CACHE_LIMIT).await {
-            Ok(klines) if !klines.is_empty() => {
-                // 在日志中加入 klines.len()
-                info!(
-                    "[{}/{}] Warming cache for {}/{}... ({} klines)",
-                    i + 1,
-                    total_keys,
-                    symbol,
-                    interval,
-                    klines.len()
-                );
-                cache_manager.warm_up(&symbol, &interval, klines);
-            }
-            Ok(_) => info!(
-                "[{}/{}] No data in DB for {}/{}, skipping.",
-                i + 1, total_keys, symbol, interval
-            ),
-            Err(e) => error!(
-                "[{}/{}] Failed to warm up cache for {}/{}: {}",
-                i + 1, total_keys, symbol, interval, e
-            ),
-        }
-    }
-    info!("✅ Cache pre-warming finished.");
-
+    // --- 3. 启动 Web 服务器 ---
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -165,7 +174,6 @@ async fn main() {
             header::CONTENT_TYPE,
             "Access-Control-Request-Private-Network".parse().unwrap(),
         ]);
-    info!("CORS middleware configured for PNA.");
 
     let app = Router::new()
         .route(
@@ -176,11 +184,7 @@ async fn main() {
             "/download-binary/{symbol}/{interval}",
             get(web_server::binary_kline_handler),
         )
-        .route("/test-download", get(web_server::test_download_handler))
-        .route(
-            "/test-download-binary",
-            get(web_server::test_download_binary_handler),
-        )
+        // ... 其他路由 ...
         .with_state(cache_manager)
         .layer(middleware::from_fn(log_requests))
         .layer(cors)
@@ -188,24 +192,6 @@ async fn main() {
 
     let addr = "127.0.0.1:3000";
     let listener = TcpListener::bind(addr).await.expect("Failed to bind");
-    info!("🚀 Server listening on http://{}", addr);
-    info!("🌐 Now accessible from public websites due to PNA headers.");
-    info!("---");
-    info!("👉 JSON Test endpoint:   curl http://{}/test-download", addr);
-    info!(
-        "👉 Binary Test endpoint: curl http://{}/test-download-binary -o test.bin",
-        addr
-    );
-    info!("---");
-    info!(
-        "👉 General JSON endpoint:   curl \"http://{}/download/ETHUSDT/5m?limit=10\"",
-        addr
-    );
-    info!(
-        "👉 General Binary endpoint: curl \"http://{}/download-binary/BTCUSDT/5m?limit=10\" -o klines.bin",
-        addr
-    );
-    info!("---");
-
+    info!("🚀 服务正在监听 http://{}", addr);
     axum::serve(listener, app).await.unwrap();
 }
