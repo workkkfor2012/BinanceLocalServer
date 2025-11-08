@@ -13,9 +13,11 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
+// 修改 KlineParams 来包含新的 'source' 字段
 #[derive(Debug, Deserialize)]
 pub struct KlineParams {
-    // 这些参数目前由缓存逻辑处理，但保留结构以备将来使用
+    pub source: Option<String>,
+    // 其他参数保留，即使当前未使用
     #[serde(rename = "startTime")]
     pub _start_time: Option<i64>,
     #[serde(rename = "endTime")]
@@ -27,11 +29,18 @@ pub struct KlineParams {
 pub async fn proxy_kline_handler(
     State(cache_manager): State<Arc<CacheManager>>,
     Path((symbol, interval)): Path<(String, String)>,
-    Query(_params): Query<KlineParams>, // params are ignored, cache manager handles logic
+    Query(params): Query<KlineParams>,
 ) -> Result<impl IntoResponse> {
-    info!("Received JSON request for {}/{}", symbol, interval);
+    // 默认行为是 'update'
+    let source = params.source.unwrap_or_else(|| "update".to_string());
+    info!(
+        "Received JSON request for {}/{} with source={}",
+        symbol, interval, source
+    );
 
-    let klines = cache_manager.get_klines(&symbol, &interval).await?;
+    let klines = cache_manager
+        .get_klines(&symbol, &interval, &source)
+        .await?;
 
     info!(
         "Responding with {} k-lines for JSON request: {}/{}",
@@ -47,12 +56,17 @@ pub async fn proxy_kline_handler(
 pub async fn binary_kline_handler(
     State(cache_manager): State<Arc<CacheManager>>,
     Path((symbol, interval)): Path<(String, String)>,
-    Query(_params): Query<KlineParams>,
+    Query(params): Query<KlineParams>,
 ) -> Result<impl IntoResponse> {
-    info!("Received BINARY request for {}/{}", symbol, interval);
+    // 默认行为是 'update'
+    let source = params.source.unwrap_or_else(|| "update".to_string());
+    info!(
+        "Received BINARY request for {}/{} with source={}",
+        symbol, interval, source
+    );
 
     let klines = cache_manager
-        .get_klines(&symbol, &interval)
+        .get_klines(&symbol, &interval, &source)
         .await?;
 
     info!(
@@ -72,7 +86,7 @@ pub async fn binary_kline_handler(
     Ok((headers, binary_blob))
 }
 
-// --- 测试端点现在从 CacheManager 中获取 ApiClient ---
+// --- 测试端点保持不变，它们不参与两阶段加载逻辑 ---
 
 /// Axum Handler: 一个简单的测试端点 (JSON)
 pub async fn test_download_handler(
@@ -88,7 +102,6 @@ pub async fn test_download_handler(
         limit: 5,
     };
 
-    // 直接使用 cache_manager 内部的 api_client，绕过缓存
     let klines = cache_manager
         .api_client
         .download_continuous_klines(&task)

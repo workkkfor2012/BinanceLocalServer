@@ -1,6 +1,6 @@
 // src/main.rs
 mod api_client;
-mod cache_manager; // 名字可以不改，但职责变了
+mod cache_manager;
 mod db_manager;
 mod error;
 mod models;
@@ -30,8 +30,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-// 日志清理任务等辅助函数保持不变...
-// ... (此处省略 spawn_log_cleanup_task, log_requests, PrivateNetworkAccessLayer 等代码)
+// --- (此处省略所有未改变的辅助函数: spawn_log_cleanup_task, log_requests, PrivateNetworkAccessLayer) ---
 async fn spawn_log_cleanup_task() {
     info!("🧹 日志清理服务已启动，将每小时检查一次旧日志。");
     let mut interval = interval(Duration::from_secs(3600));
@@ -135,10 +134,9 @@ where
     }
 }
 
-
 #[tokio::main]
 async fn main() {
-    // 日志初始化...
+    // --- 日志初始化 (无变化) ---
     let file_appender = tracing_appender::rolling::hourly("./", "start.log");
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
@@ -149,24 +147,23 @@ async fn main() {
     info!("程序启动，日志系统已初始化。");
     tokio::spawn(spawn_log_cleanup_task());
 
-    // --- 1. 初始化依赖 ---
+    // --- 1. 初始化依赖 (无变化) ---
     let api_client = Arc::new(ApiClient::new().expect("Failed to create API clients"));
     info!("API 客户端已初始化。");
 
     let db_manager = Arc::new(DbManager::new().await.expect("Failed to initialize DbManager"));
     info!("数据库管理器已初始化。");
 
-    // --- 2. 注入依赖 ---
+    // --- 2. 注入依赖 (CacheManager::new 调用无变化) ---
     let cache_manager = Arc::new(CacheManager::new(
         api_client.clone(),
         db_manager.clone(),
     ));
     info!("数据服务已准备就绪。");
     
-    // --- 【核心】不再有任何预热逻辑 ---
-    info!("✅ 服务已准备就绪，无需预热。");
+    info!("✅ 服务已准备就绪，将根据客户端请求提供数据。");
 
-    // --- 3. 启动 Web 服务器 ---
+    // --- 3. 启动 Web 服务器 (无变化) ---
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -184,7 +181,14 @@ async fn main() {
             "/download-binary/{symbol}/{interval}",
             get(web_server::binary_kline_handler),
         )
-        // ... 其他路由 ...
+        .route(
+            "/test-download", 
+            get(web_server::test_download_handler)
+        )
+        .route(
+            "/test-download-binary",
+            get(web_server::test_download_binary_handler),
+        )
         .with_state(cache_manager)
         .layer(middleware::from_fn(log_requests))
         .layer(cors)
