@@ -42,7 +42,6 @@ impl CacheManager {
         symbol: &str,
         interval: &str,
     ) -> Result<Vec<Kline>> {
-        info!("⚡️ [DB_ONLY] Serving {}/{} directly from database.", symbol, interval);
         self.db_manager
             .get_latest_klines(symbol, interval, KLINE_FULL_FETCH_LIMIT)
             .await
@@ -53,7 +52,6 @@ impl CacheManager {
         symbol: &str,
         interval: &str,
     ) -> Result<Vec<Kline>> {
-        info!("🔄 [UPDATE] Starting full data sync for {}/{}.", symbol, interval);
 
         // 1. 从DB读取现有数据
         let mut klines_from_db = self
@@ -98,15 +96,12 @@ impl CacheManager {
         };
 
         // 4. (同步)从API获取新数据
-        info!("-> [API_FETCH] Fetching new klines for {}/{} since {:?}.", symbol, interval, start_time);
         let new_klines = self.api_client.download_continuous_klines(&task).await?;
 
         if new_klines.is_empty() {
-            info!("✅ [UPDATE] No new klines from API. Returning {} klines from DB.", klines_from_db.len());
             return Ok(klines_from_db);
         }
         
-        info!("-> [API_FETCH] Fetched {} new klines for {}/{}.", new_klines.len(), symbol, interval);
 
         // 5. (后台)异步将新数据写入数据库
         let db_manager = self.db_manager.clone();
@@ -114,11 +109,7 @@ impl CacheManager {
         let symbol_clone = symbol.to_string();
         let interval_clone = interval.to_string();
         task::spawn(async move {
-            info!("💾 [ASYNC_DB] Spawning task to persist {} new klines for {}/{}", klines_to_save.len(), symbol_clone, interval_clone);
             if let Err(e) = db_manager.save_klines(&symbol_clone, &interval_clone, &klines_to_save).await {
-                warn!("❌ [ASYNC_DB] Failed to save new klines to DB for {}/{}: {}", symbol_clone, interval_clone, e);
-            } else {
-                info!("✅ [ASYNC_DB] Successfully saved new klines for {}/{}", symbol_clone, interval_clone);
             }
         });
 
@@ -138,7 +129,6 @@ impl CacheManager {
             klines_from_db.drain(..overflow);
         }
         
-        info!("🚀 [UPDATE] Responding with {} merged klines for {}/{}.", klines_from_db.len(), symbol, interval);
 
         // 8. 返回合并后的最新数据
         Ok(klines_from_db)

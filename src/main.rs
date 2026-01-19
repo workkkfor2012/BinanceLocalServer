@@ -90,9 +90,6 @@ async fn spawn_log_cleanup_task() {
     }
 }
 async fn log_requests(req: Request, next: Next) -> Response {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    info!("⬅️ 收到请求: {} {}", method, uri);
     next.run(req).await
 }
 #[derive(Clone)]

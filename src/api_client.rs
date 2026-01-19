@@ -60,19 +60,12 @@ impl ApiClient {
         let start_time = Instant::now();
 
         // 1. 首先尝试 Mokex
-        // trace!("Attempting primary source (Mokex) for task: {:?}", task);
-        info!("🌐 [DEBUG_API] 尝试主线路 (Mokex): {}/{}", task.symbol, task.interval);
         let mokex_result = self
             .fetch_klines(&self.mokex_client, MOKEX_BASE_URL, task)
             .await;
 
         match mokex_result {
             Ok(klines) => {
-                info!(
-                    "✅ [DEBUG_API] Mokex 成功 ({:.2?}). Task: {}/{}",
-                    start_time.elapsed(),
-                    task.symbol, task.interval
-                );
                 Ok(klines)
             }
             Err(e) => {
@@ -84,23 +77,12 @@ impl ApiClient {
                 let mut last_error: Option<AppError> = None;
 
                 for attempt in 1..=FALLBACK_RETRIES {
-                    info!(
-                        "🔄 [DEBUG_API] Binance 重试 {}/{}: {}/{}",
-                        attempt,
-                        FALLBACK_RETRIES,
-                        task.symbol, task.interval
-                    );
 
                     match self
                         .fetch_klines(&self.binance_client, BINANCE_BASE_URL, task)
                         .await
                     {
                         Ok(klines) => {
-                            info!(
-                                "✅ [DEBUG_API] Binance 成功 (第 {} 次) in {:.2?}.",
-                                attempt,
-                                start_time.elapsed()
-                            );
                             return Ok(klines);
                         }
                         Err(retry_err) => {
@@ -155,12 +137,8 @@ impl ApiClient {
 
         // --- 【核心修复】 ---
         // 移除了不安全的字符串切片 `&url[..60]`，直接打印完整的 URL。
-        // 这彻底解决了在多字节字符边界上 panic 的问题。
-        info!("📡 [DEBUG_API_REQ] 发送 HTTP GET: {}", &url);
         let response = client.get(&url).send().await?.error_for_status()?;
-        info!("📩 [DEBUG_API_REQ] 收到 HTTP 响应头 (准备读取 body)");
         let response_text = response.text().await?;
-        info!("📦 [DEBUG_API_REQ] 读取 body 完成 ({} bytes)", response_text.len());
 
         let raw_klines: Vec<Vec<Value>> = serde_json::from_str(&response_text)?;
 

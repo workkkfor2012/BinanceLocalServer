@@ -349,7 +349,6 @@ impl TradingViewProxy {
                         }
                         // 发送全量数据
                         if !data.is_empty() {
-                            info!("[{}] 收到全量历史数据 ({} 条)", symbol, data.len());
                             let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
                                 symbol: symbol.to_string(),
                                 data,
@@ -368,7 +367,6 @@ impl TradingViewProxy {
                                         close: v[4].as_f64().unwrap_or(0.0),
                                         volume: v[5].as_f64().unwrap_or(0.0),
                                     };
-                                    info!("[{}] 收到最新K线: t={}, c={}", symbol, kline.timestamp, kline.close);
                                     let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
                                         symbol: symbol.to_string(),
                                         kline,
