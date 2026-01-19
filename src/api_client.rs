@@ -69,11 +69,6 @@ impl ApiClient {
                 Ok(klines)
             }
             Err(e) => {
-                warn!(
-                    "⚠️ [DEBUG_API] Mokex 失败: {}. 切换到 Binance 重试.",
-                    e
-                );
-                
                 let mut last_error: Option<AppError> = None;
 
                 for attempt in 1..=FALLBACK_RETRIES {
@@ -86,10 +81,6 @@ impl ApiClient {
                             return Ok(klines);
                         }
                         Err(retry_err) => {
-                            warn!(
-                                "❌ [DEBUG_API] Binance 尝试 {} 失败: {}",
-                                attempt, retry_err
-                            );
                             last_error = Some(retry_err);
 
                             if attempt < FALLBACK_RETRIES {
@@ -99,10 +90,6 @@ impl ApiClient {
                     }
                 }
 
-                warn!(
-                    "⛔ [DEBUG_API] 所有重试均失败: {}/{}",
-                     task.symbol, task.interval
-                );
                 Err(last_error.unwrap())
             }
         }

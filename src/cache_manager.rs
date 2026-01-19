@@ -72,10 +72,6 @@ impl CacheManager {
                 let candles_to_fetch = time_gap_ms / interval_ms;
 
                 if candles_to_fetch > KLINE_FULL_FETCH_LIMIT as i64 {
-                    warn!(
-                        "⚠️ [CACHE_RESET] Data for {}/{} is too old (gap is {} candles > {}). Deleting local cache and performing a full fetch.",
-                        symbol, interval, candles_to_fetch, KLINE_FULL_FETCH_LIMIT
-                    );
                     // (a) 删除DB中的旧数据
                     self.db_manager.delete_klines_for_symbol_interval(symbol, interval).await?;
                     // (b) 重置任务为全量更新

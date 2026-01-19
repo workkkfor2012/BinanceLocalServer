@@ -58,14 +58,12 @@ impl DbManager {
     pub async fn delete_klines_for_symbol_interval(&self, symbol: &str, interval: &str) -> Result<()> {
         let symbol = symbol.to_string();
         let interval = interval.to_string();
-        info!("🗑️ [DB_DELETE_ALL] Deleting all klines for {}/{}...", &symbol, &interval);
 
         self.conn.call(move |conn| {
             let deleted_rows = conn.execute(
                 "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2",
                 params![symbol, interval],
             )?;
-            info!("✅ [DB_DELETE_ALL] Successfully deleted {} rows.", deleted_rows);
             Ok(())
         }).await?;
         
@@ -133,22 +131,12 @@ impl DbManager {
             )?;
 
             if count > PRUNE_TRIGGER_COUNT {
-                info!(
-                    "✂️ [DB_PRUNE] Triggering prune for {}/{}. Current count: {}.",
-                    symbol, interval, count
-                );
-
                 let deleted_rows = conn.execute(
                     "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2 AND open_time IN (
                         SELECT open_time FROM klines WHERE symbol = ?1 AND interval = ?2 ORDER BY open_time ASC LIMIT ?3
                     )",
                     params![&symbol, &interval, (count - PRUNE_KEEP_COUNT)],
                 )?;
-
-                info!(
-                    "✅ [DB_PRUNE] Pruning complete for {}/{}. Deleted {} rows. New count is now {}.",
-                    symbol, interval, deleted_rows, (count - deleted_rows as i64)
-                );
             }
             Ok(())
         }).await?;
