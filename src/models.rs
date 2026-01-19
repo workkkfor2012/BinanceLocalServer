@@ -50,3 +50,27 @@ pub struct DownloadTask {
     pub end_time: Option<i64>,
     pub limit: usize,
 }
+
+/// 专门用于 JSON 接口的输出 DTO
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KlineJsonDto {
+    pub time: i64,       // 秒级时间戳
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+impl From<&Kline> for KlineJsonDto {
+    fn from(k: &Kline) -> Self {
+        Self {
+            time: k.open_time / 1000, // 转换为秒
+            open: k.open.parse::<f64>().unwrap_or(0.0),
+            high: k.high.parse::<f64>().unwrap_or(0.0),
+            low: k.low.parse::<f64>().unwrap_or(0.0),
+            close: k.close.parse::<f64>().unwrap_or(0.0),
+            volume: k.volume.parse::<f64>().unwrap_or(0.0),
+        }
+    }
+}

@@ -178,6 +178,10 @@ async fn main() {
             get(web_server::proxy_kline_handler),
         )
         .route(
+            "/download-json/{symbol}/{interval}",
+            get(web_server::json_kline_handler),
+        )
+        .route(
             "/download-binary/{symbol}/{interval}",
             get(web_server::binary_kline_handler),
         )

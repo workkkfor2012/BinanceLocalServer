@@ -1,7 +1,7 @@
 // src/web_server.rs
 use crate::cache_manager::CacheManager;
 use crate::error::Result;
-use crate::models::DownloadTask;
+use crate::models::{DownloadTask, KlineJsonDto};
 use crate::transformer;
 use axum::{
     extract::{Path, Query, State},
@@ -50,6 +50,34 @@ pub async fn proxy_kline_handler(
     );
 
     Ok(Json(klines))
+}
+
+/// Axum Handler: 获取 K 线数据并以符合前端要求的 JSON 格式返回 (秒级时间戳, 数值类型)
+pub async fn json_kline_handler(
+    State(cache_manager): State<Arc<CacheManager>>,
+    Path((symbol, interval)): Path<(String, String)>,
+    Query(params): Query<KlineParams>,
+) -> Result<impl IntoResponse> {
+    let source = params.source.unwrap_or_else(|| "update".to_string());
+    info!(
+        "Received JSON (precise) request for {}/{} with source={}",
+        symbol, interval, source
+    );
+
+    let klines = cache_manager
+        .get_klines(&symbol, &interval, &source)
+        .await?;
+
+    info!(
+        "Mapping {} k-lines to precise JSON format for: {}/{}",
+        klines.len(),
+        symbol,
+        interval
+    );
+
+    let json_data: Vec<KlineJsonDto> = klines.iter().map(KlineJsonDto::from).collect();
+
+    Ok(Json(json_data))
 }
 
 /// Axum Handler: 获取K线数据并以二进制格式返回
