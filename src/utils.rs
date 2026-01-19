@@ -21,3 +21,13 @@ pub fn interval_to_milliseconds(interval: &str) -> Result<i64> {
         ))),
     }
 }
+
+pub fn generate_random_string(len: usize) -> String {
+    use rand::distributions::Alphanumeric;
+    use rand::{thread_rng, Rng};
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
+}

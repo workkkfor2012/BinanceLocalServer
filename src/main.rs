@@ -7,6 +7,7 @@ mod models;
 mod transformer;
 mod utils;
 mod web_server;
+mod tradingview_proxy;
 
 use crate::api_client::ApiClient;
 use crate::cache_manager::CacheManager;
@@ -161,7 +162,14 @@ async fn main() {
     ));
     info!("数据服务已准备就绪。");
     
-    info!("✅ 服务已准备就绪，将根据客户端请求提供数据。");
+    // --- 3. 启动 TradingView 代理服务 ---
+    let tv_proxy = Arc::new(tradingview_proxy::TradingViewProxy::new());
+    let tv_proxy_start = tv_proxy.clone();
+    tokio::spawn(async move {
+        tv_proxy_start.start().await;
+    });
+
+    info!("✅ 所有服务已准备就绪。");
 
     // --- 3. 启动 Web 服务器 (无变化) ---
     let cors = CorsLayer::new()

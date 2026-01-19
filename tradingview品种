@@ -1,0 +1,63 @@
+export const 多图配置 = [
+    {
+        "symbol": "NASDAQ:NVDA",
+        "tick": 1,
+        "name": "英伟达"
+    },
+    {
+        "symbol": "NASDAQ:TSLA",
+        "tick": 1,
+        "name": "特斯拉"
+    },
+    {
+        "symbol": "NASDAQ:GOOG",
+        "tick": 1,
+        "name": "GOOG"
+    },
+    {
+        "symbol": "NASDAQ:MSFT",
+        "tick": 1,
+        "name": "微软"
+    },
+    {
+        "symbol": "NASDAQ:META",
+        "tick": 1,
+        "name": "META"
+    },
+    {
+        "symbol": "NASDAQ:GOOGL",
+        "tick": 1,
+        "name": "GOOGL"
+    },
+    {
+        "symbol": "NASDAQ:AAPL",
+        "tick": 1,
+        "name": "苹果"
+    },
+    {
+        "symbol": "NASDAQ:AMZN",
+        "tick": 1,
+        "name": "亚马逊"
+    },
+    {
+        "symbol": "TVC:GOLD",
+        "tick": 1,
+        "name": "黄金"
+    },
+    {
+        "symbol": "TVC:DXY",
+        "tick": 0.1,
+        "name": "美元指数"
+    },
+    {
+        "symbol": "CAPITALCOM:US500",
+        "tick": 1,
+        "name": "标普500期货"
+    },
+    {
+        "symbol": "SP:SPX",
+        "tick": 1,
+        "name": "标普500"
+    },
+
+]

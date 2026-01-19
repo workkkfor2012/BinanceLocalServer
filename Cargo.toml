@@ -11,7 +11,8 @@ axum = "0.8.6"
 tokio = { version = "1.48.0", features = ["full"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tower = "0.5.2" # tower::Layer 和 tower::Service trait
-futures = "0.3.31" # 用于自定义中间件中的 BoxFuture
+futures = "0.3.31" 
+http = "1.0"
 
 # --- 日志 ---
 tracing = "0.1.41"
@@ -32,7 +33,15 @@ dashmap = "6.1.0" # <-- 新增
 thiserror = "2.0.17"
 chrono = "0.4.42"
 once_cell = "1.21.3"
+rand = "0.8.5"
 
 # --- 数据库 ---
 tokio-rusqlite = "0.6.0"
 rusqlite = { version = "0.32.0", features = ["bundled", "chrono"] }
+
+# --- WebSocket & URL ---
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
+url = "2.5.4"
+tokio-socks = "0.5.2"
+rustls = "0.23"
+webpki-roots = "0.26"
