@@ -620,3 +620,244 @@ async fn handle_frontend_message(
         }
     }
 }
+
+// ============================================================================
+// UserDataProxy - 私有数据流代理 (端口 6003)
+// ============================================================================
+
+use crate::api_client::ApiClient;
+use crate::config::Config;
+
+/// 私有数据流服务端口
+const USER_DATA_PORT: u16 = 6003;
+/// listenKey 续期间隔 (50分钟)
+const LISTEN_KEY_KEEPALIVE_MINS: u64 = 50;
+
+/// 私有数据流代理
+pub struct UserDataProxy {
+    api_client: Arc<ApiClient>,
+    config: Arc<Config>,
+    /// 广播通道
+    broadcast_tx: broadcast::Sender<Value>,
+    /// 当前 listenKey
+    listen_key: Arc<RwLock<Option<String>>>,
+}
+
+impl UserDataProxy {
+    pub fn new(api_client: Arc<ApiClient>, config: Arc<Config>) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(1000);
+        
+        Self {
+            api_client,
+            config,
+            broadcast_tx,
+            listen_key: Arc::new(RwLock::new(None)),
+        }
+    }
+    
+    pub async fn start(self: Arc<Self>) {
+        info!("🚀 启动币安私有数据流代理服务 (端口 {})...", USER_DATA_PORT);
+        
+        // 启动 listenKey 管理器
+        let proxy_clone = self.clone();
+        tokio::spawn(async move {
+            proxy_clone.run_listen_key_manager().await;
+        });
+        
+        // 启动前端服务器
+        let proxy_clone = self.clone();
+        tokio::spawn(async move {
+            proxy_clone.run_frontend_server().await;
+        });
+    }
+    
+    /// listenKey 管理器：获取、续期、维护 WebSocket 连接
+    async fn run_listen_key_manager(&self) {
+        loop {
+            // 获取 listenKey
+            match self.api_client.post_listen_key().await {
+                Ok(key) => {
+                    *self.listen_key.write().await = Some(key.clone());
+                    
+                    // 启动 WebSocket 连接和续期任务
+                    let (ws_result, _) = tokio::join!(
+                        self.run_user_data_connection(&key),
+                        self.run_keepalive_task()
+                    );
+                    
+                    // 连接断开，清理 listenKey
+                    *self.listen_key.write().await = None;
+                    
+                    warn!("⚠️ 私有数据流连接断开，5秒后重连...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    error!("❌ 获取 listenKey 失败: {}，30秒后重试...", e);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+    }
+    
+    /// 续期任务
+    async fn run_keepalive_task(&self) {
+        let mut interval = interval(Duration::from_secs(LISTEN_KEY_KEEPALIVE_MINS * 60));
+        
+        loop {
+            interval.tick().await;
+            
+            if self.listen_key.read().await.is_none() {
+                break;
+            }
+            
+            if let Err(e) = self.api_client.put_listen_key().await {
+                warn!("⚠️ listenKey 续期失败: {}", e);
+            }
+        }
+    }
+    
+    /// 维护与币安的私有数据 WebSocket 连接
+    async fn run_user_data_connection(&self, listen_key: &str) {
+        // 构建 WebSocket URL
+        let direct_url = format!("{}/ws/{}", self.config.binance.direct_ws_base, listen_key);
+        let proxy_url = format!("{}/ws/{}", self.config.binance.proxy_ws_base, listen_key);
+        
+        info!("🔗 连接私有数据流: {}...", &direct_url[..50.min(direct_url.len())]);
+        
+        // 尝试直连
+        let ws_stream = match tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_async(&direct_url)
+        ).await {
+            Ok(Ok((ws, _))) => {
+                info!("✅ 私有数据流直连成功");
+                ws
+            }
+            _ => {
+                // 回退到代理
+                info!("🔄 直连失败，尝试通过代理连接...");
+                match connect_via_socks5_proxy(&proxy_url, &self.config.binance.socks5_proxy).await {
+                    Ok(ws) => {
+                        info!("✅ 私有数据流通过代理连接成功");
+                        ws
+                    }
+                    Err(e) => {
+                        error!("❌ 私有数据流连接失败: {}", e);
+                        return;
+                    }
+                }
+            }
+        };
+        
+        let (mut write, mut read) = ws_stream.split();
+        
+        loop {
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            debug!("📨 收到私有数据: {}", &text[..100.min(text.len())]);
+                            
+                            if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                                // 广播给所有前端
+                                let _ = self.broadcast_tx.send(data);
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            debug!("收到 Ping，回复 Pong");
+                            if let Err(e) = write.send(Message::Pong(payload)).await {
+                                error!("发送 Pong 失败: {}", e);
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            warn!("币安主动关闭私有数据流连接");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("私有数据流 WebSocket 错误: {}", e);
+                            break;
+                        }
+                        None => {
+                            warn!("私有数据流连接已断开");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    
+    /// 前端 WebSocket 服务器
+    async fn run_frontend_server(&self) {
+        let addr = format!("0.0.0.0:{}", USER_DATA_PORT);
+        let listener = TcpListener::bind(&addr).await.expect(&format!("无法绑定端口 {}", USER_DATA_PORT));
+        info!("📡 私有数据代理服务正在监听: ws://{}", addr);
+        
+        while let Ok((stream, addr)) = listener.accept().await {
+            let broadcast_rx = self.broadcast_tx.subscribe();
+            
+            tokio::spawn(async move {
+                handle_user_data_frontend(stream, addr, broadcast_rx).await;
+            });
+        }
+    }
+}
+
+/// 处理私有数据前端连接
+async fn handle_user_data_frontend(
+    stream: TcpStream,
+    addr: std::net::SocketAddr,
+    mut broadcast_rx: broadcast::Receiver<Value>,
+) {
+    info!("📱 私有数据客户端连接: {}", addr);
+    
+    let ws_stream = match accept_async(stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("WebSocket 握手失败 ({}): {}", addr, e);
+            return;
+        }
+    };
+    
+    let (mut write, mut read) = ws_stream.split();
+    
+    loop {
+        tokio::select! {
+            // 接收前端消息（目前只处理订阅请求，但私有流是自动的）
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        debug!("收到前端消息: {}", text);
+                        // 目前不需要处理，私有流自动推送
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            
+            // 广播私有数据到前端
+            msg = broadcast_rx.recv() => {
+                match msg {
+                    Ok(data) => {
+                        if let Ok(json) = serde_json::to_string(&data) {
+                            if let Err(e) = write.send(Message::Text(json.into())).await {
+                                warn!("发送私有数据到前端失败 ({}): {}", addr, e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("私有数据客户端 {} 丢失 {} 条消息", addr, n);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    
+    info!("📱 私有数据客户端断开: {}", addr);
+}

@@ -17,7 +17,10 @@ pub enum AppError {
     Join(#[from] JoinError),
 
     #[error("Database error: {0}")]
-    Database(#[from] tokio_rusqlite::Error), // <-- **核心修复**: 添加此行
+    Database(#[from] tokio_rusqlite::Error),
+
+    #[error("Config error: {0}")]
+    Config(String),
 
     #[error("API logic error: {0}")]
     ApiLogic(String),

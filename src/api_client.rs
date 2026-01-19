@@ -1,14 +1,16 @@
 // src/api_client.rs
+use crate::config::BinanceConfig;
 use crate::error::{AppError, Result};
 use crate::models::{DownloadTask, Kline};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::sleep;
-use tracing::{info, trace, warn, instrument}; // 添加 instrument
+use tracing::{debug, info, instrument, trace, warn};
 
 // Constants
 const MOKEX_BASE_URL: &str = "https://www.mokexapp.info";
@@ -17,10 +19,19 @@ const PROXY_URL: &str = "http://127.0.0.1:1080";
 const FALLBACK_RETRIES: u32 = 10;
 const RETRY_DELAY_MS: u64 = 10;
 
+/// listenKey 响应结构
+#[derive(Debug, Deserialize)]
+pub struct ListenKeyResponse {
+    #[serde(rename = "listenKey")]
+    pub listen_key: String,
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     mokex_client: Arc<Client>,
     binance_client: Arc<Client>,
+    /// 币安配置（可选，用于私有 API）
+    binance_config: Option<Arc<BinanceConfig>>,
 }
 
 impl ApiClient {
@@ -37,21 +48,34 @@ impl ApiClient {
 
         let mokex_client = Client::builder()
             .default_headers(mokex_headers)
-            .timeout(Duration::from_secs(10)) // 添加超时，防止网络层永久卡死
+            .timeout(Duration::from_secs(10))
             .build()
             .map_err(AppError::Reqwest)?;
 
         let proxy = reqwest::Proxy::all(PROXY_URL).map_err(AppError::Reqwest)?;
         let binance_client = Client::builder()
             .proxy(proxy)
-            .timeout(Duration::from_secs(10)) // 添加超时
+            .timeout(Duration::from_secs(10))
             .build()
             .map_err(AppError::Reqwest)?;
 
         Ok(Self {
             mokex_client: Arc::new(mokex_client),
             binance_client: Arc::new(binance_client),
+            binance_config: None,
         })
+    }
+
+    /// 创建带 API Key 配置的客户端
+    pub fn new_with_config(config: BinanceConfig) -> Result<Self> {
+        let mut client = Self::new()?;
+        client.binance_config = Some(Arc::new(config));
+        Ok(client)
+    }
+
+    /// 获取配置
+    pub fn config(&self) -> Option<&BinanceConfig> {
+        self.binance_config.as_ref().map(|c| c.as_ref())
     }
 
     /// 使用 fallback 和 retry 逻辑下载K线
@@ -102,13 +126,6 @@ impl ApiClient {
         base_url: &str,
         task: &DownloadTask,
     ) -> Result<Vec<Kline>> {
-        // --- 疑问与探讨点 ---
-        // 这里手动拼接 URL 字符串，如果 symbol 包含特殊字符（除了中文，还有像 &、= 等），
-        // 可能会导致 URL 解析错误。一个更健壮的做法是使用 reqwest 的查询参数构建器，
-        // 它会自动处理 URL 编码。例如：
-        // client.get(url)
-        //       .query(&[("pair", &task.symbol), ("interval", &task.interval), ...])
-        // 这样做会让代码更安全，不过当前 `format!` 的方式也能工作，因为 reqwest 内部会编码整个 URL。
         let mut url_params = format!(
             "pair={}&contractType=PERPETUAL&interval={}&limit={}",
             task.symbol, task.interval, task.limit
@@ -122,8 +139,6 @@ impl ApiClient {
 
         let url = format!("{}/fapi/v1/continuousKlines?{}", base_url, url_params);
 
-        // --- 【核心修复】 ---
-        // 移除了不安全的字符串切片 `&url[..60]`，直接打印完整的 URL。
         let response = client.get(&url).send().await?.error_for_status()?;
         let response_text = response.text().await?;
 
@@ -140,5 +155,135 @@ impl ApiClient {
             .collect::<Vec<Kline>>();
 
         Ok(klines)
+    }
+
+    // ========== listenKey API ==========
+
+    /// 创建 listenKey
+    pub async fn post_listen_key(&self) -> Result<String> {
+        let config = self.binance_config.as_ref()
+            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
+        
+        info!("📡 正在获取 listenKey...");
+        
+        // 构建签名参数
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let query = format!("timestamp={}&recvWindow=60000", timestamp);
+        let signature = config.sign(&query);
+        let full_query = format!("{}&signature={}", query, signature);
+        
+        // 首先尝试直连
+        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
+        debug!("listenKey URL: {}", url);
+        
+        let response = self.mokex_client
+            .post(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send()
+            .await;
+        
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let data: ListenKeyResponse = resp.json().await?;
+                info!("✅ listenKey 获取成功: {}...", &data.listen_key[..16.min(data.listen_key.len())]);
+                return Ok(data.listen_key);
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!("直连获取 listenKey 失败: {} - {}", status, body);
+            }
+            Err(e) => {
+                warn!("直连获取 listenKey 失败: {}", e);
+            }
+        }
+        
+        // 回退到代理
+        info!("🔄 尝试通过代理获取 listenKey...");
+        let url = format!("{}/fapi/v1/listenKey?{}", config.proxy_rest_base, full_query);
+        
+        let response = self.binance_client
+            .post(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        
+        let data: ListenKeyResponse = response.json().await?;
+        info!("✅ listenKey 通过代理获取成功: {}...", &data.listen_key[..16.min(data.listen_key.len())]);
+        Ok(data.listen_key)
+    }
+
+    /// 续期 listenKey
+    pub async fn put_listen_key(&self) -> Result<()> {
+        let config = self.binance_config.as_ref()
+            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
+        
+        debug!("🔄 正在续期 listenKey...");
+        
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let query = format!("timestamp={}&recvWindow=60000", timestamp);
+        let signature = config.sign(&query);
+        let full_query = format!("{}&signature={}", query, signature);
+        
+        // 首先尝试直连
+        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
+        
+        let response = self.mokex_client
+            .put(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send()
+            .await;
+        
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                info!("✅ listenKey 续期成功");
+                return Ok(());
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                warn!("直连续期 listenKey 失败: {}", status);
+            }
+            Err(e) => {
+                warn!("直连续期 listenKey 失败: {}", e);
+            }
+        }
+        
+        // 回退到代理
+        let url = format!("{}/fapi/v1/listenKey?{}", config.proxy_rest_base, full_query);
+        
+        self.binance_client
+            .put(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        
+        info!("✅ listenKey 通过代理续期成功");
+        Ok(())
+    }
+
+    /// 删除 listenKey
+    pub async fn delete_listen_key(&self) -> Result<()> {
+        let config = self.binance_config.as_ref()
+            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
+        
+        debug!("🗑️ 正在删除 listenKey...");
+        
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let query = format!("timestamp={}&recvWindow=60000", timestamp);
+        let signature = config.sign(&query);
+        let full_query = format!("{}&signature={}", query, signature);
+        
+        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
+        
+        let _ = self.mokex_client
+            .delete(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send()
+            .await;
+        
+        info!("🗑️ listenKey 已删除");
+        Ok(())
     }
 }

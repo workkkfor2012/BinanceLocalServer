@@ -1,0 +1,21 @@
+# BinanceLocalServer 配置文件
+# 请勿将此文件提交到版本控制！
+
+[binance]
+# API 密钥（从币安获取）
+api_key = "kWImFoYo5zv7r2cNcHGSDAXdnI41Y5r4DWwocL405xBFQNZjqaIuD83cNpWeB958"
+api_secret = "gbsH85HUBVeGwTW8YfjrTEj7VZg8LqyqPg2TmMp3Xz7bWLLLYYmBDAS8esbuaMR2"
+
+# 直连端点（无需翻墙，国内可用）
+direct_rest_base = "https://www.mokexapp.info"
+direct_ws_base = "wss://fstream.mokexapp.info"
+
+# 代理端点（需要翻墙）
+proxy_rest_base = "https://fapi.binance.com"
+proxy_ws_base = "wss://fstream.binance.com"
+
+# SOCKS5 代理地址
+socks5_proxy = "127.0.0.1:1080"
+
+
+

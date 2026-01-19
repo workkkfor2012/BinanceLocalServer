@@ -2,6 +2,7 @@
 mod api_client;
 mod binance_proxy;
 mod cache_manager;
+mod config;
 mod db_manager;
 mod error;
 mod models;
@@ -167,12 +168,38 @@ async fn main() {
         tv_proxy_start.start().await;
     });
     
-    // --- 4. 启动 Binance WebSocket 代理服务 ---
+    // --- 4. 启动 Binance WebSocket 代理服务 (K线, 端口 6002) ---
     let binance_proxy = Arc::new(binance_proxy::BinanceProxy::new());
     let binance_proxy_start = binance_proxy.clone();
     tokio::spawn(async move {
         binance_proxy_start.start().await;
     });
+    
+    // --- 5. 加载配置并启动私有数据流服务 (端口 6003) ---
+    if let Some(config) = config::Config::load() {
+        let config = Arc::new(config);
+        
+        // 创建带 API Key 的客户端
+        match api_client::ApiClient::new_with_config(config.binance.clone()) {
+            Ok(private_client) => {
+                let private_client = Arc::new(private_client);
+                let user_data_proxy = Arc::new(binance_proxy::UserDataProxy::new(
+                    private_client,
+                    config.clone(),
+                ));
+                let user_data_proxy_start = user_data_proxy.clone();
+                tokio::spawn(async move {
+                    user_data_proxy_start.start().await;
+                });
+                info!("✅ 私有数据流服务已启动 (端口 6003)");
+            }
+            Err(e) => {
+                warn!("⚠️ 无法创建带 API Key 的客户端: {}", e);
+            }
+        }
+    } else {
+        info!("ℹ️ 配置文件未加载，私有数据流服务已禁用");
+    }
 
     info!("✅ 所有服务已准备就绪。");
 
