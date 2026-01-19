@@ -217,22 +217,6 @@ impl TradingViewProxy {
     async fn run_subscription_manager(&self) {
         let mut sub_rx = self.sub_rx.lock().await;
 
-        // --- 自动订阅测试 ---
-        let test_symbol = "BINANCE:BTCUSDT".to_string();
-        info!("执行自动订阅测试: {}", test_symbol);
-        {
-            let mut subs = self.subscribed_symbols.lock().await;
-            if !subs.contains(&test_symbol) {
-                subs.insert(test_symbol.clone());
-                let tx = self.broadcast_tx.clone();
-                let sym_clone = test_symbol.clone();
-                tokio::spawn(async move {
-                    Self::connect_and_maintain_symbol(sym_clone, tx).await;
-                });
-            }
-        }
-        // ------------------
-
         while let Some(symbol) = sub_rx.recv().await {
             let mut subs = self.subscribed_symbols.lock().await;
             if subs.contains(&symbol) {
@@ -418,8 +402,10 @@ async fn handle_frontend_connection(
             msg = ws_stream.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        info!("收到前端消息 ({}): {}", addr, text);
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if val.is_array() && val[0] == "addSubscriptions" {
+                                info!("处理订阅请求 ({}): {}", addr, val);
                                 if let Some(symbols) = val[1].get("symbols").and_then(|s| s.as_array()) {
                                     for sym in symbols {
                                         if let Some(s) = sym.as_str() {
@@ -430,11 +416,22 @@ async fn handle_frontend_connection(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        info!("前端主动断开连接 ({})", addr);
+                        break;
+                    }
                     _ => {}
                 }
             }
             Ok(msg) = rx.recv() => {
+                match &msg {
+                    FrontendMessage::History(p) => {
+                        info!("发送历史数据到前端 ({}): symbol={}, kline_count={}", addr, p.symbol, p.data.len());
+                    }
+                    FrontendMessage::UpdateLast(p) => {
+                        debug!("发送实时更新到前端 ({}): symbol={}, time={}, close={}", addr, p.symbol, p.kline.timestamp, p.kline.close);
+                    }
+                }
                 if let Ok(json_msg) = serde_json::to_string(&msg) {
                     if let Err(e) = ws_stream.send(Message::Text(json_msg.into())).await {
                         warn!("发送消息到前端时出错 ({}): {}", addr, e);

@@ -1,5 +1,6 @@
 // src/main.rs
 mod api_client;
+mod binance_proxy;
 mod cache_manager;
 mod db_manager;
 mod error;
@@ -164,6 +165,13 @@ async fn main() {
     let tv_proxy_start = tv_proxy.clone();
     tokio::spawn(async move {
         tv_proxy_start.start().await;
+    });
+    
+    // --- 4. 启动 Binance WebSocket 代理服务 ---
+    let binance_proxy = Arc::new(binance_proxy::BinanceProxy::new());
+    let binance_proxy_start = binance_proxy.clone();
+    tokio::spawn(async move {
+        binance_proxy_start.start().await;
     });
 
     info!("✅ 所有服务已准备就绪。");
