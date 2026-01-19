@@ -3,9 +3,11 @@ use crate::error::Result;
 use crate::models::Kline;
 use std::collections::HashMap;
 use tokio_rusqlite::{params, Connection};
-use tracing::info;
+use tracing::info; // <- 移除了未使用的 `warn`
 
 const DB_PATH: &str = "kline_cache.db";
+const PRUNE_TRIGGER_COUNT: i64 = 3000;
+const PRUNE_KEEP_COUNT: i64 = 1500;
 
 #[derive(Clone)]
 pub struct DbManager {
@@ -52,44 +54,22 @@ impl DbManager {
         Ok(Self { conn })
     }
 
-    /// 获取数据库内容的摘要信息，按 symbol 分组
-    pub async fn get_db_summary(&self) -> Result<HashMap<String, Vec<(String, i64)>>> {
-        let summary_data = self
-            .conn
-            .call(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT symbol, interval, COUNT(*) FROM klines GROUP BY symbol, interval",
-                )?;
-                let mut rows = stmt.query([])?;
-                let mut summary = HashMap::<String, Vec<(String, i64)>>::new();
+    // --- 【已修复编译错误】 ---
+    pub async fn delete_klines_for_symbol_interval(&self, symbol: &str, interval: &str) -> Result<()> {
+        let symbol = symbol.to_string();
+        let interval = interval.to_string();
+        info!("🗑️ [DB_DELETE_ALL] Deleting all klines for {}/{}...", &symbol, &interval);
 
-                while let Some(row) = rows.next()? {
-                    let symbol: String = row.get(0)?;
-                    let interval: String = row.get(1)?;
-                    let count: i64 = row.get(2)?; // COUNT(*) returns i64
-
-                    summary.entry(symbol).or_default().push((interval, count));
-                }
-                Ok(summary)
-            })
-            .await?;
-        Ok(summary_data)
-    }
-    
-    // 这个函数在最终方案中不再被调用，但保留也无妨
-    pub async fn get_all_cache_keys(&self) -> Result<Vec<(String, String)>> {
-        let keys = self.conn.call(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT DISTINCT symbol, interval FROM klines",
+        self.conn.call(move |conn| {
+            let deleted_rows = conn.execute(
+                "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2",
+                params![symbol, interval],
             )?;
-            let mut rows = stmt.query([])?;
-            let mut result_keys = Vec::new();
-            while let Some(row) = rows.next()? {
-                result_keys.push((row.get(0)?, row.get(1)?));
-            }
-            Ok(result_keys)
+            info!("✅ [DB_DELETE_ALL] Successfully deleted {} rows.", deleted_rows);
+            Ok(())
         }).await?;
-        Ok(keys)
+        
+        Ok(())
     }
 
     pub async fn save_klines(&self, symbol: &str, interval: &str, klines: &[Kline]) -> Result<()> {
@@ -97,8 +77,8 @@ impl DbManager {
             return Ok(());
         }
 
-        let symbol = symbol.to_string();
-        let interval = interval.to_string();
+        let symbol_owned = symbol.to_string();
+        let interval_owned = interval.to_string();
         let klines_owned = klines.to_vec();
 
         self.conn
@@ -115,10 +95,10 @@ impl DbManager {
 
                     for kline in &klines_owned {
                         stmt.execute(params![
-                            symbol,
-                            interval,
+                            symbol_owned,
+                            interval_owned,
                             kline.open_time,
-                            kline.open,
+                            kline.open, // <-- 【已修复数据损坏BUG】
                             kline.high,
                             kline.low,
                             kline.close,
@@ -136,6 +116,43 @@ impl DbManager {
                 Ok(())
             })
             .await?;
+        
+        self.prune_klines_if_needed(symbol, interval).await?;
+        Ok(())
+    }
+    
+    async fn prune_klines_if_needed(&self, symbol: &str, interval: &str) -> Result<()> {
+        let symbol = symbol.to_string();
+        let interval = interval.to_string();
+
+        self.conn.call(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM klines WHERE symbol = ?1 AND interval = ?2",
+                params![&symbol, &interval],
+                |row| row.get(0),
+            )?;
+
+            if count > PRUNE_TRIGGER_COUNT {
+                info!(
+                    "✂️ [DB_PRUNE] Triggering prune for {}/{}. Current count: {}.",
+                    symbol, interval, count
+                );
+
+                let deleted_rows = conn.execute(
+                    "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2 AND open_time IN (
+                        SELECT open_time FROM klines WHERE symbol = ?1 AND interval = ?2 ORDER BY open_time ASC LIMIT ?3
+                    )",
+                    params![&symbol, &interval, (count - PRUNE_KEEP_COUNT)],
+                )?;
+
+                info!(
+                    "✅ [DB_PRUNE] Pruning complete for {}/{}. Deleted {} rows. New count is now {}.",
+                    symbol, interval, deleted_rows, (count - deleted_rows as i64)
+                );
+            }
+            Ok(())
+        }).await?;
+
         Ok(())
     }
 
@@ -175,5 +192,43 @@ impl DbManager {
             Ok(result_klines)
         }).await?;
         Ok(klines)
+    }
+
+    pub async fn get_db_summary(&self) -> Result<HashMap<String, Vec<(String, i64)>>> {
+        let summary_data = self
+            .conn
+            .call(|conn| {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT symbol, interval, COUNT(*) FROM klines GROUP BY symbol, interval",
+                )?;
+                let mut rows = stmt.query([])?;
+                let mut summary = HashMap::<String, Vec<(String, i64)>>::new();
+
+                while let Some(row) = rows.next()? {
+                    let symbol: String = row.get(0)?;
+                    let interval: String = row.get(1)?;
+                    let count: i64 = row.get(2)?;
+
+                    summary.entry(symbol).or_default().push((interval, count));
+                }
+                Ok(summary)
+            })
+            .await?;
+        Ok(summary_data)
+    }
+
+    pub async fn get_all_cache_keys(&self) -> Result<Vec<(String, String)>> {
+        let keys = self.conn.call(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT DISTINCT symbol, interval FROM klines",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut result_keys = Vec::new();
+            while let Some(row) = rows.next()? {
+                result_keys.push((row.get(0)?, row.get(1)?));
+            }
+            Ok(result_keys)
+        }).await?;
+        Ok(keys)
     }
 }

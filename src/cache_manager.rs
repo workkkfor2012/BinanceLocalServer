@@ -3,13 +3,14 @@ use crate::api_client::ApiClient;
 use crate::db_manager::DbManager;
 use crate::error::Result;
 use crate::models::{DownloadTask, Kline};
+use crate::utils; // <-- 引入 utils
+use chrono::Utc; // <-- 引入 Utc 用于获取当前时间
 use std::sync::Arc;
 use tokio::task;
 use tracing::{info, instrument, warn};
 
 pub const KLINE_FULL_FETCH_LIMIT: usize = 1500;
 
-// 职责变为：根据前端指令，协调数据源
 pub struct CacheManager {
     pub api_client: Arc<ApiClient>,
     pub db_manager: Arc<DbManager>,
@@ -35,8 +36,7 @@ impl CacheManager {
             _ => self.get_klines_with_update(symbol, interval).await,
         }
     }
-
-    /// 方案一：只从数据库读取数据并立即返回
+    
     async fn get_klines_from_db_only(
         &self,
         symbol: &str,
@@ -48,7 +48,6 @@ impl CacheManager {
             .await
     }
 
-    /// 方案二：从API更新，内存合并，后台写库，返回新数据
     async fn get_klines_with_update(
         &self,
         symbol: &str,
@@ -62,17 +61,43 @@ impl CacheManager {
             .get_latest_klines(symbol, interval, KLINE_FULL_FETCH_LIMIT)
             .await?;
         
-        // 2. 准备API下载任务
-        let start_time = klines_from_db.last().map(|k| k.open_time);
+        // 2. 准备API下载任务的初始 start_time
+        let mut start_time = klines_from_db.last().map(|k| k.open_time);
+
+        // --- 【核心逻辑：主动重置判断】 ---
+        if let Some(last_open_time) = start_time {
+            if let Ok(interval_ms) = utils::interval_to_milliseconds(interval) {
+                let current_time_ms = Utc::now().timestamp_millis();
+                let time_gap_ms = current_time_ms - last_open_time;
+                
+                // 计算需要补齐多少根K线
+                let candles_to_fetch = time_gap_ms / interval_ms;
+
+                if candles_to_fetch > KLINE_FULL_FETCH_LIMIT as i64 {
+                    warn!(
+                        "⚠️ [CACHE_RESET] Data for {}/{} is too old (gap is {} candles > {}). Deleting local cache and performing a full fetch.",
+                        symbol, interval, candles_to_fetch, KLINE_FULL_FETCH_LIMIT
+                    );
+                    // (a) 删除DB中的旧数据
+                    self.db_manager.delete_klines_for_symbol_interval(symbol, interval).await?;
+                    // (b) 重置任务为全量更新
+                    start_time = None;
+                    // (c) 清空内存中的旧数据
+                    klines_from_db.clear();
+                }
+            }
+        }
+        
+        // 3. 创建最终的下载任务
         let task = DownloadTask {
             symbol: symbol.to_string(),
             interval: interval.to_string(),
-            start_time,
+            start_time, // 可能是原始值，也可能被重置为 None
             end_time: None,
             limit: KLINE_FULL_FETCH_LIMIT,
         };
 
-        // 3. (同步)从API获取新数据
+        // 4. (同步)从API获取新数据
         info!("-> [API_FETCH] Fetching new klines for {}/{} since {:?}.", symbol, interval, start_time);
         let new_klines = self.api_client.download_continuous_klines(&task).await?;
 
@@ -83,7 +108,7 @@ impl CacheManager {
         
         info!("-> [API_FETCH] Fetched {} new klines for {}/{}.", new_klines.len(), symbol, interval);
 
-        // 4. (后台)异步将新数据写入数据库
+        // 5. (后台)异步将新数据写入数据库
         let db_manager = self.db_manager.clone();
         let klines_to_save = new_klines.clone();
         let symbol_clone = symbol.to_string();
@@ -97,8 +122,7 @@ impl CacheManager {
             }
         });
 
-        // 5. (同步)在内存中合并新旧数据
-        // 检查最后一个旧K线和第一个新K线是否有重叠（时间戳相同），如有则移除旧的那个
+        // 6. (同步)在内存中合并新旧数据
         if let Some(last_db_kline) = klines_from_db.last() {
              if let Some(first_new_kline) = new_klines.first() {
                  if last_db_kline.open_time == first_new_kline.open_time {
@@ -108,16 +132,15 @@ impl CacheManager {
         }
         klines_from_db.extend(new_klines);
 
-        // 6. 确保返回的数据不超过限制
+        // 7. 确保返回的数据不超过限制
         if klines_from_db.len() > KLINE_FULL_FETCH_LIMIT {
             let overflow = klines_from_db.len() - KLINE_FULL_FETCH_LIMIT;
-            // 从开头移除多余的旧数据，保留最新的
             klines_from_db.drain(..overflow);
         }
         
         info!("🚀 [UPDATE] Responding with {} merged klines for {}/{}.", klines_from_db.len(), symbol, interval);
 
-        // 7. 返回合并后的最新数据
+        // 8. 返回合并后的最新数据
         Ok(klines_from_db)
     }
 }

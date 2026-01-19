@@ -194,7 +194,7 @@ async fn main() {
         .layer(cors)
         .layer(PrivateNetworkAccessLayer);
 
-    let addr = "127.0.0.1:3000";
+    let addr = "127.0.0.1:30000";
     let listener = TcpListener::bind(addr).await.expect("Failed to bind");
     info!("🚀 服务正在监听 http://{}", addr);
     axum::serve(listener, app).await.unwrap();
