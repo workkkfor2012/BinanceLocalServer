@@ -289,9 +289,12 @@ impl ApiClient {
 
     /// 转发账号请求 (fapi/v2/account)
     pub async fn forward_account_request(&self, query: &str, headers: HeaderMap) -> Result<String> {
+        info!("▶️ 开始处理账号信息请求转发");
+        
         // 1. 尝试直连 (Mokex)
         // 注意：这里我们使用传进来的 query，因为它已经包含了 signature
         let url = format!("{}/fapi/v2/account?{}", MOKEX_BASE_URL, query);
+        debug!("尝试通过直连地址: {}", url);
         
         let mut req_builder = self.mokex_client.get(&url);
         // 转发特定的 Headers (主要是 API Key)
@@ -302,28 +305,42 @@ impl ApiClient {
         match req_builder.send().await {
             Ok(resp) if resp.status().is_success() => {
                  let text = resp.text().await?;
-                 debug!("✅ Account info fetched via Direct connection");
+                 info!("✅ [直连成功] 已通过 Mokex 获取账号信息");
                  return Ok(text);
             }
             Ok(resp) => {
-                 warn!("Direct account request failed status: {}", resp.status());
+                 warn!("⚠️ [直连失败] Mokex 返回状态码: {}", resp.status());
             }
             Err(e) => {
-                 warn!("Direct account request failed error: {}", e);
+                 warn!("⚠️ [直连失败] 请求错误: {}", e);
             }
         }
 
         // 2. 尝试代理 (Binance)
-        info!("🔄 尝试通过代理获取账号信息...");
+        info!("🔄 直连失败，尝试切换到代理通道 (Binance)...");
         let url = format!("{}/fapi/v2/account?{}", BINANCE_BASE_URL, query);
         let mut req_builder = self.binance_client.get(&url);
          for (k, v) in headers.iter() {
              req_builder = req_builder.header(k, v);
         }
         
-        let resp = req_builder.send().await?.error_for_status()?;
-        let text = resp.text().await?;
-        debug!("✅ Account info fetched via Proxy");
-        Ok(text)
+        match req_builder.send().await {
+             Ok(resp) => {
+                 let status = resp.status();
+                 if status.is_success() {
+                     let text = resp.text().await?;
+                     info!("✅ [代理成功] 已通过 Binance 代理获取账号信息");
+                     Ok(text)
+                 } else {
+                     let err_text = resp.text().await.unwrap_or_default();
+                     warn!("❌ [代理失败] Binance 返回状态码: {}, 响应: {}", status, err_text);
+                     Err(AppError::ApiLogic(format!("Binance Proxy Error: Status {}, Body: {}", status, err_text)))
+                 }
+             }
+             Err(e) => {
+                 warn!("❌ [代理失败] 请求错误: {}", e);
+                 Err(AppError::Reqwest(e))
+             }
+        }
     }
 }

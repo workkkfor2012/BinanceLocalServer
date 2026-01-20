@@ -89,6 +89,7 @@ pub async fn proxy_account_handler(
 ) -> Result<impl IntoResponse> {
     // 获取原始查询字符串 (包含 signature)
     let query_string = req.uri().query().unwrap_or("").to_string();
+    info!("🔄 收到账号信息代理请求");
     let headers = req.headers();
 
     // 提取需要的 Headers
