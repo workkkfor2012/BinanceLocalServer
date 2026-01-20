@@ -548,6 +548,7 @@ async fn handle_frontend_connection(
                             if val.is_array() && val[0] == "addSubscriptions" {
                                 // 处理订阅请求
                                 if let Some(symbols) = val[1].get("symbols").and_then(|s| s.as_array()) {
+                                    info!("前端请求订阅品种: {:?}", symbols);
                                     for sym in symbols {
                                         if let Some(s) = sym.as_str() {
                                             let _ = sub_tx.send(s.to_string()).await;
