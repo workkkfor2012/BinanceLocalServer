@@ -277,7 +277,7 @@ impl TradingViewProxy {
                     // 3. create series
                     socket.send(Message::Text(TvProtocol::format_packet(&json!({
                         "m": "create_series",
-                        "p": [&session_id, "$prices", "s1", series_id, tv_timeframe, 300]
+                        "p": [&session_id, "$prices", "s1", series_id, tv_timeframe, 2000]
                     })).into())).await.ok();
                     
                     info!("[{}] 创建 session {} 订阅周期: {}", symbol, session_id, period_name);
