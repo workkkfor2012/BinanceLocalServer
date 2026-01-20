@@ -299,7 +299,8 @@ impl TradingViewProxy {
                         if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
                             if v.len() >= 6 {
                                 data.push(Kline {
-                                    time: v[0].as_i64().unwrap_or(0),
+                                    // TradingView 发送浮点数时间戳（秒），需要用 as_f64 解析
+                                    time: v[0].as_f64().unwrap_or(0.0) as i64,
                                     open: v[1].as_f64().unwrap_or(0.0),
                                     high: v[2].as_f64().unwrap_or(0.0),
                                     low: v[3].as_f64().unwrap_or(0.0),
@@ -325,7 +326,8 @@ impl TradingViewProxy {
                         if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
                             if v.len() >= 6 {
                                 let kline = KlineUpdate {
-                                    timestamp: v[0].as_i64().unwrap_or(0) * 1000,
+                                    // TradingView 发送浮点数时间戳（秒），转为毫秒
+                                    timestamp: (v[0].as_f64().unwrap_or(0.0) * 1000.0) as i64,
                                     open: v[1].as_f64().unwrap_or(0.0),
                                     high: v[2].as_f64().unwrap_or(0.0),
                                     low: v[3].as_f64().unwrap_or(0.0),
