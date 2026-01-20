@@ -52,6 +52,36 @@ pub struct KlineUpdate {
     pub volume: f64,
 }
 
+// 消息类型常量，与前端 SyncClient 的 MessageType 枚举一致
+const MESSAGE_TYPE_CUSTOM: u8 = 0x04;
+
+/// 构建符合前端 SyncClient 期望的二进制协议消息
+/// 格式: [MessageType(1字节)][Timestamp(8字节 f64 BE)][JSON长度(4字节 u32 BE)][JSON数据]
+fn build_custom_message(msg: &FrontendMessage) -> Vec<u8> {
+    let json_string = serde_json::to_string(msg).unwrap_or_default();
+    let json_bytes = json_string.as_bytes();
+    
+    let mut buffer = Vec::with_capacity(1 + 8 + 4 + json_bytes.len());
+    
+    // [1] MessageType: CustomMessage = 0x04
+    buffer.push(MESSAGE_TYPE_CUSTOM);
+    
+    // [8] Timestamp: Float64 BE (毫秒时间戳)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64;
+    buffer.extend_from_slice(&timestamp.to_be_bytes());
+    
+    // [4] JSON Length: Uint32 BE
+    buffer.extend_from_slice(&(json_bytes.len() as u32).to_be_bytes());
+    
+    // [N] JSON Data
+    buffer.extend_from_slice(json_bytes);
+    
+    buffer
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", content = "payload")]
 pub enum FrontendMessage {
@@ -432,11 +462,11 @@ async fn handle_frontend_connection(
                         debug!("发送实时更新到前端 ({}): symbol={}, time={}, close={}", addr, p.symbol, p.kline.timestamp, p.kline.close);
                     }
                 }
-                if let Ok(json_msg) = serde_json::to_string(&msg) {
-                    if let Err(e) = ws_stream.send(Message::Text(json_msg.into())).await {
-                        warn!("发送消息到前端时出错 ({}): {}", addr, e);
-                        break;
-                    }
+                // 使用二进制协议发送消息，与前端 SyncClient 的期望匹配
+                let binary_msg = build_custom_message(&msg);
+                if let Err(e) = ws_stream.send(Message::Binary(binary_msg.into())).await {
+                    warn!("发送消息到前端时出错 ({}): {}", addr, e);
+                    break;
                 }
             }
         }
