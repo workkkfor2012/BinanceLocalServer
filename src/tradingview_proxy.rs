@@ -261,20 +261,18 @@ impl TradingViewProxy {
                     "p": [&session_id]
                 })).into())).await.ok();
 
-                // 为每个周期创建 series
-                for (period_name, tv_timeframe, series_suffix) in PERIODS.iter() {
-                    let series_id = format!("ser_{}", series_suffix);
-                    
-                    // resolve_symbol (共享同一个 symbol)
-                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "resolve_symbol",
-                        "p": [&session_id, &series_id, format!("={}", json!({"symbol": &symbol}))]
-                    })).into())).await.ok();
+                // resolve_symbol 只调用一次，所有 series 共用
+                let symbol_id = "symbol_1";
+                socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                    "m": "resolve_symbol",
+                    "p": [&session_id, symbol_id, format!("={}", json!({"symbol": &symbol}))]
+                })).into())).await.ok();
 
-                    // create_series (指定周期)
+                // 为每个周期创建 series（共用同一个 resolved symbol）
+                for (period_name, tv_timeframe, series_suffix) in PERIODS.iter() {
                     socket.send(Message::Text(TvProtocol::format_packet(&json!({
                         "m": "create_series",
-                        "p": [&session_id, format!("$prices_{}", series_suffix), series_suffix, &series_id, tv_timeframe, 300]
+                        "p": [&session_id, format!("$prices_{}", series_suffix), series_suffix, symbol_id, tv_timeframe, 300]
                     })).into())).await.ok();
                     
                     info!("[{}] 已订阅周期: {} (series: {})", symbol, period_name, series_suffix);
