@@ -293,9 +293,7 @@ impl TradingViewProxy {
                 while let Some(msg) = socket.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            // [调试] 打印原始消息（截取前 500 字符）
-                            let preview = if text.len() > 500 { &text[..500] } else { &text };
-                            info!("[{}] 收到消息: {}", symbol, preview);
+
                             
                             for packet in TvProtocol::parse_packets(&text) {
                                 match packet {
@@ -303,9 +301,7 @@ impl TradingViewProxy {
                                         socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
                                     }
                                     TvPacket::Data(val) => {
-                                        // [调试] 打印解析后的消息类型
-                                        let msg_type = val.get("m").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                        info!("[{}] 解析消息类型: {}", symbol, msg_type);
+
                                         
                                         Self::process_tv_data_by_session(
                                             &symbol,
