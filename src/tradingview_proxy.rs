@@ -253,29 +253,34 @@ impl TradingViewProxy {
                     "p": ["unauthorized_user_token"]
                 })).into())).await.ok();
 
-                // 创建 session
-                let session_id = format!("cs_{}", crate::utils::generate_random_string(12));
+                // 为每个周期创建独立的 chart_session (与前端一致)
+                // session_id -> period_name 映射
+                let mut session_to_period: HashMap<String, String> = HashMap::new();
                 
-                socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                    "m": "chart_create_session",
-                    "p": [&session_id]
-                })).into())).await.ok();
-
-                // resolve_symbol 只调用一次，所有 series 共用
-                let symbol_id = "symbol_1";
-                socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                    "m": "resolve_symbol",
-                    "p": [&session_id, symbol_id, format!("={}", json!({"symbol": &symbol}))]
-                })).into())).await.ok();
-
-                // 为每个周期创建 series（共用同一个 resolved symbol）
-                for (period_name, tv_timeframe, series_suffix) in PERIODS.iter() {
+                for (period_name, tv_timeframe, _) in PERIODS.iter() {
+                    let session_id = format!("cs_{}", crate::utils::generate_random_string(12));
+                    session_to_period.insert(session_id.clone(), period_name.to_string());
+                    
+                    // 1. 创建 chart session
                     socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "create_series",
-                        "p": [&session_id, format!("$prices_{}", series_suffix), series_suffix, symbol_id, tv_timeframe, 300]
+                        "m": "chart_create_session",
+                        "p": [&session_id]
                     })).into())).await.ok();
                     
-                    info!("[{}] 已订阅周期: {} (series: {})", symbol, period_name, series_suffix);
+                    // 2. resolve symbol
+                    let series_id = "ser_1";
+                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                        "m": "resolve_symbol",
+                        "p": [&session_id, series_id, format!("={}", json!({"symbol": &symbol}))]
+                    })).into())).await.ok();
+                    
+                    // 3. create series
+                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                        "m": "create_series",
+                        "p": [&session_id, "$prices", "s1", series_id, tv_timeframe, 300]
+                    })).into())).await.ok();
+                    
+                    info!("[{}] 创建 session {} 订阅周期: {}", symbol, session_id, period_name);
                 }
 
                 // 每个周期的历史数据发送标记
@@ -288,18 +293,27 @@ impl TradingViewProxy {
                 while let Some(msg) = socket.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
+                            // [调试] 打印原始消息（截取前 500 字符）
+                            let preview = if text.len() > 500 { &text[..500] } else { &text };
+                            info!("[{}] 收到消息: {}", symbol, preview);
+                            
                             for packet in TvProtocol::parse_packets(&text) {
                                 match packet {
                                     TvPacket::Heartbeat(num) => {
                                         socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
                                     }
                                     TvPacket::Data(val) => {
-                                        Self::process_tv_data_multi_period(
+                                        // [调试] 打印解析后的消息类型
+                                        let msg_type = val.get("m").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        info!("[{}] 解析消息类型: {}", symbol, msg_type);
+                                        
+                                        Self::process_tv_data_by_session(
                                             &symbol,
                                             val,
                                             &broadcast_tx,
                                             &cache,
                                             &mut history_sent,
+                                            &session_to_period,
                                         ).await;
                                     }
                                 }
@@ -324,109 +338,99 @@ impl TradingViewProxy {
         }
     }
 
-    /// 解析 series 后缀得到周期名称
-    fn series_suffix_to_period(suffix: &str) -> Option<&'static str> {
-        for (period_name, _, series_suffix) in PERIODS.iter() {
-            if *series_suffix == suffix {
-                return Some(period_name);
-            }
-        }
-        None
-    }
-
-    /// 处理多周期数据：解析 series key，写入对应周期缓存
-    async fn process_tv_data_multi_period(
+    /// 处理数据：通过 session_id 映射确定周期
+    async fn process_tv_data_by_session(
         symbol: &str,
         val: Value,
         broadcast_tx: &broadcast::Sender<FrontendMessage>,
         cache: &Arc<RwLock<HashMap<String, Vec<Kline>>>>,
         history_sent: &mut HashMap<String, bool>,
+        session_to_period: &HashMap<String, String>,
     ) {
         let m = val.get("m").and_then(|v| v.as_str());
         let p = val.get("p").and_then(|v| v.as_array());
 
         match (m, p) {
             (Some("timescale_update"), Some(p)) if p.len() >= 2 => {
-                // 遍历所有 $prices_sX key
-                if let Some(obj) = p[1].as_object() {
-                    for (key, series_data) in obj.iter() {
-                        // key 格式: "$prices_s1", "$prices_s2", ...
-                        if !key.starts_with("$prices_") {
-                            continue;
+                // p[0] 是 session_id
+                let session_id = match p[0].as_str() {
+                    Some(s) => s,
+                    None => return,
+                };
+                
+                // 通过 session_id 查找周期
+                let period_name = match session_to_period.get(session_id) {
+                    Some(p) => p.clone(),
+                    None => {
+                        info!("[{}] 未知 session: {}", symbol, session_id);
+                        return;
+                    }
+                };
+                let cache_key = format!("{}_{}", symbol, period_name);
+                
+                // 数据在 p[1].$prices.s 中
+                if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
+                    let is_first = !*history_sent.get(&period_name).unwrap_or(&true);
+                    
+                    if is_first {
+                        // 首次：写入缓存并发送历史数据
+                        let mut data = Vec::new();
+                        for item in prices {
+                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                if v.len() >= 6 {
+                                    data.push(Kline {
+                                        time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                        open: v[1].as_f64().unwrap_or(0.0),
+                                        high: v[2].as_f64().unwrap_or(0.0),
+                                        low: v[3].as_f64().unwrap_or(0.0),
+                                        close: v[4].as_f64().unwrap_or(0.0),
+                                        volume: v[5].as_f64().unwrap_or(0.0),
+                                    });
+                                }
+                            }
                         }
-                        let suffix = &key[8..]; // 提取 "s1", "s2", ...
-                        let period_name = match Self::series_suffix_to_period(suffix) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        let cache_key = format!("{}_{}", symbol, period_name);
-                        
-                        // 解析 K 线数据
-                        if let Some(prices) = series_data.get("s").and_then(|v| v.as_array()) {
-                            let is_first = !*history_sent.get(period_name).unwrap_or(&true);
+                        if !data.is_empty() {
+                            // 写入缓存
+                            {
+                                let mut cache_guard = cache.write().await;
+                                cache_guard.insert(cache_key.clone(), data.clone());
+                            }
                             
-                            if is_first {
-                                // 首次：写入缓存并发送历史数据
-                                let mut data = Vec::new();
-                                for item in prices {
-                                    if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                        if v.len() >= 6 {
-                                            data.push(Kline {
-                                                time: v[0].as_f64().unwrap_or(0.0) as i64,
-                                                open: v[1].as_f64().unwrap_or(0.0),
-                                                high: v[2].as_f64().unwrap_or(0.0),
-                                                low: v[3].as_f64().unwrap_or(0.0),
-                                                close: v[4].as_f64().unwrap_or(0.0),
-                                                volume: v[5].as_f64().unwrap_or(0.0),
-                                            });
-                                        }
-                                    }
-                                }
-                                if !data.is_empty() {
-                                    // 写入缓存
-                                    {
-                                        let mut cache_guard = cache.write().await;
-                                        cache_guard.insert(cache_key.clone(), data.clone());
-                                    }
+                            info!("[{}] 周期 {} 历史数据: {} 根 K 线", symbol, period_name, data.len());
+                            let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
+                                symbol: cache_key,
+                                data,
+                            }));
+                            history_sent.insert(period_name.clone(), true);
+                        }
+                    } else {
+                        // 后续：追加到缓存并发送增量更新
+                        for item in prices {
+                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                if v.len() >= 6 {
+                                    let kline = Kline {
+                                        time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                        open: v[1].as_f64().unwrap_or(0.0),
+                                        high: v[2].as_f64().unwrap_or(0.0),
+                                        low: v[3].as_f64().unwrap_or(0.0),
+                                        close: v[4].as_f64().unwrap_or(0.0),
+                                        volume: v[5].as_f64().unwrap_or(0.0),
+                                    };
                                     
-                                    info!("[{}] 周期 {} 历史数据: {} 根 K 线", symbol, period_name, data.len());
-                                    let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
-                                        symbol: cache_key,
-                                        data,
+                                    Self::update_cache(cache, &cache_key, &kline).await;
+                                    
+                                    let kline_update = KlineUpdate {
+                                        timestamp: kline.time * 1000,
+                                        open: kline.open,
+                                        high: kline.high,
+                                        low: kline.low,
+                                        close: kline.close,
+                                        volume: kline.volume,
+                                    };
+                                    let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                        symbol: cache_key.clone(),
+                                        kline: kline_update,
                                     }));
-                                    history_sent.insert(period_name.to_string(), true);
-                                }
-                            } else {
-                                // 后续：追加到缓存并发送增量更新
-                                for item in prices {
-                                    if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                        if v.len() >= 6 {
-                                            let kline = Kline {
-                                                time: v[0].as_f64().unwrap_or(0.0) as i64,
-                                                open: v[1].as_f64().unwrap_or(0.0),
-                                                high: v[2].as_f64().unwrap_or(0.0),
-                                                low: v[3].as_f64().unwrap_or(0.0),
-                                                close: v[4].as_f64().unwrap_or(0.0),
-                                                volume: v[5].as_f64().unwrap_or(0.0),
-                                            };
-                                            
-                                            // 更新缓存
-                                            Self::update_cache(cache, &cache_key, &kline).await;
-                                            
-                                            let kline_update = KlineUpdate {
-                                                timestamp: kline.time * 1000,
-                                                open: kline.open,
-                                                high: kline.high,
-                                                low: kline.low,
-                                                close: kline.close,
-                                                volume: kline.volume,
-                                            };
-                                            let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
-                                                symbol: cache_key.clone(),
-                                                kline: kline_update,
-                                            }));
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -434,49 +438,45 @@ impl TradingViewProxy {
                 }
             }
             (Some("du"), Some(p)) if p.len() >= 2 => {
-                // 增量更新：遍历所有 $prices_sX key
-                if let Some(obj) = p[1].as_object() {
-                    for (key, series_data) in obj.iter() {
-                        if !key.starts_with("$prices_") {
-                            continue;
-                        }
-                        let suffix = &key[8..];
-                        let period_name = match Self::series_suffix_to_period(suffix) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        let cache_key = format!("{}_{}", symbol, period_name);
-                        
-                        if let Some(prices) = series_data.get("s").and_then(|v| v.as_array()) {
-                            for item in prices {
-                                if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                    if v.len() >= 6 {
-                                        let kline = Kline {
-                                            time: v[0].as_f64().unwrap_or(0.0) as i64,
-                                            open: v[1].as_f64().unwrap_or(0.0),
-                                            high: v[2].as_f64().unwrap_or(0.0),
-                                            low: v[3].as_f64().unwrap_or(0.0),
-                                            close: v[4].as_f64().unwrap_or(0.0),
-                                            volume: v[5].as_f64().unwrap_or(0.0),
-                                        };
-                                        
-                                        // 更新缓存
-                                        Self::update_cache(cache, &cache_key, &kline).await;
-                                        
-                                        let kline_update = KlineUpdate {
-                                            timestamp: kline.time * 1000,
-                                            open: kline.open,
-                                            high: kline.high,
-                                            low: kline.low,
-                                            close: kline.close,
-                                            volume: kline.volume,
-                                        };
-                                        let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
-                                            symbol: cache_key.clone(),
-                                            kline: kline_update,
-                                        }));
-                                    }
-                                }
+                // 增量更新
+                let session_id = match p[0].as_str() {
+                    Some(s) => s,
+                    None => return,
+                };
+                
+                let period_name = match session_to_period.get(session_id) {
+                    Some(p) => p.clone(),
+                    None => return,
+                };
+                let cache_key = format!("{}_{}", symbol, period_name);
+                
+                if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
+                    for item in prices {
+                        if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                            if v.len() >= 6 {
+                                let kline = Kline {
+                                    time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                    open: v[1].as_f64().unwrap_or(0.0),
+                                    high: v[2].as_f64().unwrap_or(0.0),
+                                    low: v[3].as_f64().unwrap_or(0.0),
+                                    close: v[4].as_f64().unwrap_or(0.0),
+                                    volume: v[5].as_f64().unwrap_or(0.0),
+                                };
+                                
+                                Self::update_cache(cache, &cache_key, &kline).await;
+                                
+                                let kline_update = KlineUpdate {
+                                    timestamp: kline.time * 1000,
+                                    open: kline.open,
+                                    high: kline.high,
+                                    low: kline.low,
+                                    close: kline.close,
+                                    volume: kline.volume,
+                                };
+                                let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                    symbol: cache_key.clone(),
+                                    kline: kline_update,
+                                }));
                             }
                         }
                     }
