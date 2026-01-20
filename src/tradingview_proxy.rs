@@ -253,6 +253,7 @@ impl TradingViewProxy {
                 })).into())).await.ok();
 
                 // 消息循环
+                let mut history_sent = false; // [修复] 标记是否已发送过历史数据
                 while let Some(msg) = socket.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
@@ -262,7 +263,7 @@ impl TradingViewProxy {
                                         socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
                                     }
                                     TvPacket::Data(val) => {
-                                        Self::process_tv_data(&symbol, val, &broadcast_tx);
+                                        Self::process_tv_data(&symbol, val, &broadcast_tx, &mut history_sent);
                                     }
                                 }
                             }
@@ -286,36 +287,60 @@ impl TradingViewProxy {
         }
     }
 
-    fn process_tv_data(symbol: &str, val: Value, broadcast_tx: &broadcast::Sender<FrontendMessage>) {
+    fn process_tv_data(symbol: &str, val: Value, broadcast_tx: &broadcast::Sender<FrontendMessage>, history_sent: &mut bool) {
         let m = val.get("m").and_then(|v| v.as_str());
         let p = val.get("p").and_then(|v| v.as_array());
 
         match (m, p) {
             (Some("timescale_update"), Some(p)) if p.len() >= 2 => {
-                // 历史数据
                 if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
-                    let mut data = Vec::new();
-                    for item in prices {
-                        if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                            if v.len() >= 6 {
-                                data.push(Kline {
-                                    // TradingView 发送浮点数时间戳（秒），需要用 as_f64 解析
-                                    time: v[0].as_f64().unwrap_or(0.0) as i64,
-                                    open: v[1].as_f64().unwrap_or(0.0),
-                                    high: v[2].as_f64().unwrap_or(0.0),
-                                    low: v[3].as_f64().unwrap_or(0.0),
-                                    close: v[4].as_f64().unwrap_or(0.0),
-                                    volume: v[5].as_f64().unwrap_or(0.0),
-                                });
+                    // [修复] 只有首次 timescale_update 才作为历史数据发送
+                    // 后续的 timescale_update 转为增量更新处理
+                    if !*history_sent {
+                        // 首次：发送完整历史数据
+                        let mut data = Vec::new();
+                        for item in prices {
+                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                if v.len() >= 6 {
+                                    data.push(Kline {
+                                        time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                        open: v[1].as_f64().unwrap_or(0.0),
+                                        high: v[2].as_f64().unwrap_or(0.0),
+                                        low: v[3].as_f64().unwrap_or(0.0),
+                                        close: v[4].as_f64().unwrap_or(0.0),
+                                        volume: v[5].as_f64().unwrap_or(0.0),
+                                    });
+                                }
                             }
                         }
-                    }
-                    if !data.is_empty() {
-                        info!("[{}] 收到历史数据: {} 根 K 线", symbol, data.len());
-                        let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
-                            symbol: symbol.to_string(),
-                            data,
-                        }));
+                        if !data.is_empty() {
+                            info!("[{}] 发送历史数据: {} 根 K 线", symbol, data.len());
+                            let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
+                                symbol: symbol.to_string(),
+                                data,
+                            }));
+                            *history_sent = true;
+                        }
+                    } else {
+                        // 后续：转为增量更新
+                        for item in prices {
+                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                if v.len() >= 6 {
+                                    let kline = KlineUpdate {
+                                        timestamp: (v[0].as_f64().unwrap_or(0.0) * 1000.0) as i64,
+                                        open: v[1].as_f64().unwrap_or(0.0),
+                                        high: v[2].as_f64().unwrap_or(0.0),
+                                        low: v[3].as_f64().unwrap_or(0.0),
+                                        close: v[4].as_f64().unwrap_or(0.0),
+                                        volume: v[5].as_f64().unwrap_or(0.0),
+                                    };
+                                    let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                        symbol: symbol.to_string(),
+                                        kline,
+                                    }));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -326,7 +351,6 @@ impl TradingViewProxy {
                         if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
                             if v.len() >= 6 {
                                 let kline = KlineUpdate {
-                                    // TradingView 发送浮点数时间戳（秒），转为毫秒
                                     timestamp: (v[0].as_f64().unwrap_or(0.0) * 1000.0) as i64,
                                     open: v[1].as_f64().unwrap_or(0.0),
                                     high: v[2].as_f64().unwrap_or(0.0),
