@@ -1,7 +1,6 @@
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -56,27 +55,19 @@ pub struct KlineUpdate {
 const MESSAGE_TYPE_CUSTOM: u8 = 0x04;
 
 /// 构建符合前端 SyncClient 期望的二进制协议消息
-/// 格式: [MessageType(1字节)][Timestamp(8字节 f64 BE)][JSON长度(4字节 u32 BE)][JSON数据]
 fn build_custom_message(msg: &FrontendMessage) -> Vec<u8> {
     let json_string = serde_json::to_string(msg).unwrap_or_default();
     let json_bytes = json_string.as_bytes();
     
     let mut buffer = Vec::with_capacity(1 + 8 + 4 + json_bytes.len());
-    
-    // [1] MessageType: CustomMessage = 0x04
     buffer.push(MESSAGE_TYPE_CUSTOM);
     
-    // [8] Timestamp: Float64 BE (毫秒时间戳)
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64;
     buffer.extend_from_slice(&timestamp.to_be_bytes());
-    
-    // [4] JSON Length: Uint32 BE
     buffer.extend_from_slice(&(json_bytes.len() as u32).to_be_bytes());
-    
-    // [N] JSON Data
     buffer.extend_from_slice(json_bytes);
     
     buffer
@@ -102,16 +93,12 @@ impl TvProtocol {
     }
 
     fn format_heartbeat(num: &str) -> String {
-        // 参考 JS 实现，心跳通常也被包装在 ~m~ 帧中发送回服务器
         let msg = format!("~h~{}", num);
         format!("~m~{}~m~{}", msg.len(), msg)
     }
 
     fn parse_packets(raw: &str) -> Vec<TvPacket> {
         let mut packets = Vec::new();
-        
-        // 1. 先按 ~m~...~m~ 分割
-        // 协议格式通常是 ~m~len~m~content
         let parts: Vec<&str> = raw.split("~m~").collect();
         let mut i = 1;
         while i < parts.len() {
@@ -119,36 +106,24 @@ impl TvProtocol {
             if let Ok(len) = len_str.parse::<usize>() {
                 if i + 1 < parts.len() {
                     let content = parts[i+1];
-                    // 检查 content 长度是否足够，或者是否包含更多内容
-                    let actual_content = if content.len() > len {
-                        &content[..len]
-                    } else {
-                        content
-                    };
-
+                    let actual_content = if content.len() > len { &content[..len] } else { content };
                     if actual_content.starts_with("~h~") {
                         packets.push(TvPacket::Heartbeat(actual_content[3..].to_string()));
                     } else if let Ok(val) = serde_json::from_str::<Value>(actual_content) {
                         packets.push(TvPacket::Data(val));
-                    } else {
-                        warn!("无法解析 TV 数据内容: {}", actual_content);
                     }
                 }
-                i += 2; // 跳过 len 和 content
+                i += 2;
             } else {
-                // 如果不是数字，检查是否是独立的 ~h~ 包（有时服务器会发裸包）
                 if len_str.starts_with("~h~") {
                     packets.push(TvPacket::Heartbeat(len_str[3..].to_string()));
                 }
                 i += 1;
             }
         }
-
-        // 2. 后备方案：如果没有通过 ~m~ 分割出任何包，且以 ~h~ 开头
         if packets.is_empty() && raw.starts_with("~h~") {
             packets.push(TvPacket::Heartbeat(raw[3..].to_string()));
         }
-
         packets
     }
 }
@@ -163,27 +138,20 @@ async fn connect_via_socks5_proxy() -> Result<WebSocketStream<MaybeTlsStream<Tcp
     use tokio_socks::tcp::Socks5Stream;
     use tokio_tungstenite::client_async_tls_with_config;
     
-    info!("通过 SOCKS5 代理 {} 连接...", PROXY_ADDR);
+    info!("通过 SOCKS5 代理 {} 连接 TradingView...", PROXY_ADDR);
     
     let target_host = "data.tradingview.com";
     let target_port = 443u16;
     
-    let socks_stream = Socks5Stream::connect(
-        PROXY_ADDR,
-        (target_host, target_port),
-    ).await?;
-    
-    info!("SOCKS5 隧道已建立，正在进行 TLS 握手...");
-    
+    let socks_stream = Socks5Stream::connect(PROXY_ADDR, (target_host, target_port)).await?;
     let tcp_stream = socks_stream.into_inner();
     
-    // 使用完整 URL 构建请求
     let request = http::Request::builder()
         .method("GET")
-        .uri(TV_WS_URL)  // 使用完整的 wss:// URL
+        .uri(TV_WS_URL)
         .header("Host", target_host)
         .header("Origin", TV_ORIGIN)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header("User-Agent", "Mozilla/5.0")
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
         .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
@@ -198,14 +166,8 @@ async fn connect_via_socks5_proxy() -> Result<WebSocketStream<MaybeTlsStream<Tcp
             .with_no_client_auth()
     ));
 
-    let (ws_stream, _) = client_async_tls_with_config(
-        request,
-        tcp_stream,
-        None,
-        Some(connector),
-    ).await?;
-    
-    info!("WebSocket 连接成功建立！");
+    let (ws_stream, _) = client_async_tls_with_config(request, tcp_stream, None, Some(connector)).await?;
+    info!("TradingView WebSocket 连接成功！");
     Ok(ws_stream)
 }
 
@@ -215,7 +177,6 @@ pub struct TradingViewProxy {
     broadcast_tx: broadcast::Sender<FrontendMessage>,
     sub_tx: mpsc::Sender<String>,
     sub_rx: Arc<Mutex<mpsc::Receiver<String>>>,
-    subscribed_symbols: Arc<Mutex<HashSet<String>>>,
 }
 
 impl TradingViewProxy {
@@ -226,12 +187,11 @@ impl TradingViewProxy {
             broadcast_tx: tx,
             sub_tx,
             sub_rx: Arc::new(Mutex::new(sub_rx)),
-            subscribed_symbols: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     pub async fn start(self: Arc<Self>) {
-        info!("启动 TradingView 代理服务 (独立连接模式)...");
+        info!("启动 TradingView 代理服务 (纯中转模式)...");
         
         let proxy_clone = self.clone();
         tokio::spawn(async move {
@@ -244,88 +204,84 @@ impl TradingViewProxy {
         });
     }
 
+    /// [简化版] 每次收到订阅请求，都创建一个新的 TradingView 连接
+    /// 适合个人项目，逻辑最简单
     async fn run_subscription_manager(&self) {
         let mut sub_rx = self.sub_rx.lock().await;
 
         while let Some(symbol) = sub_rx.recv().await {
-            let mut subs = self.subscribed_symbols.lock().await;
-            if subs.contains(&symbol) {
-                // 如果已订阅，忽略
-                continue;
-            }
-            subs.insert(symbol.clone());
-
-            let tx = self.broadcast_tx.clone();
-            let sym_clone = symbol.clone();
-            info!("为符号 {} 启动新的 WebSocket 连接任务...", sym_clone);
+            info!("[订阅] 收到请求: {}, 创建新的 TradingView 连接", symbol);
             
+            let tx = self.broadcast_tx.clone();
             tokio::spawn(async move {
-                Self::connect_and_maintain_symbol(sym_clone, tx).await;
+                Self::connect_and_stream(symbol, tx).await;
             });
         }
     }
 
-    // 静态方法，不再依赖 self，而是传入必要的参数 (symbol, broadcast_tx)
-    async fn connect_and_maintain_symbol(symbol: String, broadcast_tx: broadcast::Sender<FrontendMessage>) {
-        loop {
-            info!("[{}] 正在建立独立连接: {}", symbol, TV_WS_URL);
-            
-            match connect_via_socks5_proxy().await {
-                Ok(mut socket) => {
-                    info!("[{}] WebSocket 连接成功。", symbol);
-                    
-                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "set_auth_token",
-                        "p": ["unauthorized_user_token"]
-                    })).into())).await.ok();
+    /// 建立连接并持续推送数据
+    async fn connect_and_stream(symbol: String, broadcast_tx: broadcast::Sender<FrontendMessage>) {
+        // 只连接一次，获取历史数据后持续推送增量更新
+        // 如果连接断开，这个任务就结束（前端会重新发订阅）
+        match connect_via_socks5_proxy().await {
+            Ok(mut socket) => {
+                info!("[{}] 连接成功，发送订阅请求...", symbol);
+                
+                // 认证
+                socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                    "m": "set_auth_token",
+                    "p": ["unauthorized_user_token"]
+                })).into())).await.ok();
 
-                    let session_id = format!("cs_{}", crate::utils::generate_random_string(12));
-                    let series_id = "ser_1"; 
-                    
-                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "chart_create_session",
-                        "p": [session_id]
-                    })).into())).await.ok();
-                    
-                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "resolve_symbol",
-                        "p": [session_id, series_id, format!("={}", json!({"symbol": symbol}))]
-                    })).into())).await.ok();
+                // 创建 session 和订阅
+                let session_id = format!("cs_{}", crate::utils::generate_random_string(12));
+                let series_id = "ser_1";
+                
+                socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                    "m": "chart_create_session",
+                    "p": [&session_id]
+                })).into())).await.ok();
+                
+                socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                    "m": "resolve_symbol",
+                    "p": [&session_id, series_id, format!("={}", json!({"symbol": &symbol}))]
+                })).into())).await.ok();
 
-                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                        "m": "create_series",
-                        "p": [session_id, "$prices", "s1", series_id, "1", 300]
-                    })).into())).await.ok();
+                socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                    "m": "create_series",
+                    "p": [&session_id, "$prices", "s1", series_id, "1", 300]
+                })).into())).await.ok();
 
-                    loop {
-                        match socket.next().await {
-                            Some(Ok(Message::Text(text))) => {
-                                for packet in TvProtocol::parse_packets(&text) {
-                                    match packet {
-                                        TvPacket::Heartbeat(num) => {
-                                            debug!("[{}] 收到心跳 ({}).", symbol, num);
-                                            socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
-                                        }
-                                        TvPacket::Data(val) => {
-                                            Self::process_tv_data(&symbol, val, &broadcast_tx);
-                                        }
+                // 消息循环
+                while let Some(msg) = socket.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            for packet in TvProtocol::parse_packets(&text) {
+                                match packet {
+                                    TvPacket::Heartbeat(num) => {
+                                        socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
+                                    }
+                                    TvPacket::Data(val) => {
+                                        Self::process_tv_data(&symbol, val, &broadcast_tx);
                                     }
                                 }
                             }
-                            Some(Ok(Message::Close(_))) => break,
-                            Some(Err(e)) => {
-                                error!("[{}] WS 错误: {}", symbol, e);
-                                break;
-                            }
-                            None => break,
-                            _ => {}
                         }
+                        Ok(Message::Close(_)) => {
+                            info!("[{}] 连接关闭", symbol);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("[{}] 连接错误: {}", symbol, e);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Err(e) => {
-                    error!("[{}] 连接失败: {}，5秒后重试...", symbol, e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
+                info!("[{}] 连接任务结束", symbol);
+            }
+            Err(e) => {
+                error!("[{}] 连接失败: {}", symbol, e);
             }
         }
     }
@@ -334,58 +290,52 @@ impl TradingViewProxy {
         let m = val.get("m").and_then(|v| v.as_str());
         let p = val.get("p").and_then(|v| v.as_array());
 
-        if let Some(msg_type) = m {
-            if msg_type != "du" && msg_type != "timescale_update" {
-                // 仅调试非常规消息，避免刷屏
-                debug!("[{}] 收到消息: type={}", symbol, msg_type);
-            }
-        }
-
         match (m, p) {
-            (Some("timescale_update" | "du"), Some(p)) if p.len() >= 2 => {
-                // p[1] 包含数据，不再需要通过 ID 查找 Symbol，直接使用闭包中的 symbol
+            (Some("timescale_update"), Some(p)) if p.len() >= 2 => {
+                // 历史数据
                 if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
-                    if m == Some("timescale_update") {
-                        let mut data = Vec::new();
-                        for item in prices {
-                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                if v.len() >= 6 {
-                                    data.push(Kline {
-                                        time: v[0].as_i64().unwrap_or(0),
-                                        open: v[1].as_f64().unwrap_or(0.0),
-                                        high: v[2].as_f64().unwrap_or(0.0),
-                                        low: v[3].as_f64().unwrap_or(0.0),
-                                        close: v[4].as_f64().unwrap_or(0.0),
-                                        volume: v[5].as_f64().unwrap_or(0.0),
-                                    });
-                                }
+                    let mut data = Vec::new();
+                    for item in prices {
+                        if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                            if v.len() >= 6 {
+                                data.push(Kline {
+                                    time: v[0].as_i64().unwrap_or(0),
+                                    open: v[1].as_f64().unwrap_or(0.0),
+                                    high: v[2].as_f64().unwrap_or(0.0),
+                                    low: v[3].as_f64().unwrap_or(0.0),
+                                    close: v[4].as_f64().unwrap_or(0.0),
+                                    volume: v[5].as_f64().unwrap_or(0.0),
+                                });
                             }
                         }
-                        // 发送全量数据
-                        if !data.is_empty() {
-                            let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
-                                symbol: symbol.to_string(),
-                                data,
-                            }));
-                        }
-                    } else {
-                        // 增量更新
-                        for item in prices {
-                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                if v.len() >= 6 {
-                                    let kline = KlineUpdate {
-                                        timestamp: v[0].as_i64().unwrap_or(0) * 1000,
-                                        open: v[1].as_f64().unwrap_or(0.0),
-                                        high: v[2].as_f64().unwrap_or(0.0),
-                                        low: v[3].as_f64().unwrap_or(0.0),
-                                        close: v[4].as_f64().unwrap_or(0.0),
-                                        volume: v[5].as_f64().unwrap_or(0.0),
-                                    };
-                                    let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
-                                        symbol: symbol.to_string(),
-                                        kline,
-                                    }));
-                                }
+                    }
+                    if !data.is_empty() {
+                        info!("[{}] 收到历史数据: {} 根 K 线", symbol, data.len());
+                        let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
+                            symbol: symbol.to_string(),
+                            data,
+                        }));
+                    }
+                }
+            }
+            (Some("du"), Some(p)) if p.len() >= 2 => {
+                // 增量更新
+                if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
+                    for item in prices {
+                        if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                            if v.len() >= 6 {
+                                let kline = KlineUpdate {
+                                    timestamp: v[0].as_i64().unwrap_or(0) * 1000,
+                                    open: v[1].as_f64().unwrap_or(0.0),
+                                    high: v[2].as_f64().unwrap_or(0.0),
+                                    low: v[3].as_f64().unwrap_or(0.0),
+                                    close: v[4].as_f64().unwrap_or(0.0),
+                                    volume: v[5].as_f64().unwrap_or(0.0),
+                                };
+                                let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                    symbol: symbol.to_string(),
+                                    kline,
+                                }));
                             }
                         }
                     }
@@ -398,7 +348,7 @@ impl TradingViewProxy {
     async fn run_frontend_server(&self) {
         let addr = "0.0.0.0:6001";
         let listener = TcpListener::bind(addr).await.expect("无法绑定到端口 6001");
-        info!("前端 WS 转发服务正在监听: ws://{}", addr);
+        info!("前端 WS 服务监听: ws://{}", addr);
 
         while let Ok((stream, addr)) = listener.accept().await {
             let tx = self.broadcast_tx.clone();
@@ -416,7 +366,7 @@ async fn handle_frontend_connection(
     broadcast_tx: broadcast::Sender<FrontendMessage>,
     sub_tx: mpsc::Sender<String>,
 ) {
-    info!("收到前端连接: {}", addr);
+    info!("前端连接: {}", addr);
     let mut ws_stream = match accept_async(stream).await {
         Ok(s) => s,
         Err(e) => {
@@ -435,7 +385,6 @@ async fn handle_frontend_connection(
                         info!("收到前端消息 ({}): {}", addr, text);
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if val.is_array() && val[0] == "addSubscriptions" {
-                                info!("处理订阅请求 ({}): {}", addr, val);
                                 if let Some(symbols) = val[1].get("symbols").and_then(|s| s.as_array()) {
                                     for sym in symbols {
                                         if let Some(s) = sym.as_str() {
@@ -447,7 +396,7 @@ async fn handle_frontend_connection(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        info!("前端主动断开连接 ({})", addr);
+                        info!("前端断开 ({})", addr);
                         break;
                     }
                     _ => {}
@@ -456,20 +405,15 @@ async fn handle_frontend_connection(
             Ok(msg) = rx.recv() => {
                 match &msg {
                     FrontendMessage::History(p) => {
-                        info!("发送历史数据到前端 ({}): symbol={}, kline_count={}", addr, p.symbol, p.data.len());
+                        info!("-> 前端 ({}): 历史数据 {} ({} 根)", addr, p.symbol, p.data.len());
                     }
-                    FrontendMessage::UpdateLast(p) => {
-                        debug!("发送实时更新到前端 ({}): symbol={}, time={}, close={}", addr, p.symbol, p.kline.timestamp, p.kline.close);
-                    }
+                    FrontendMessage::UpdateLast(_) => {}
                 }
-                // 使用二进制协议发送消息，与前端 SyncClient 的期望匹配
                 let binary_msg = build_custom_message(&msg);
-                if let Err(e) = ws_stream.send(Message::Binary(binary_msg.into())).await {
-                    warn!("发送消息到前端时出错 ({}): {}", addr, e);
+                if ws_stream.send(Message::Binary(binary_msg.into())).await.is_err() {
                     break;
                 }
             }
         }
     }
-    info!("前端连接断开: {}", addr);
 }
