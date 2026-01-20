@@ -1,9 +1,10 @@
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio_tungstenite::{
     tungstenite::protocol::Message,
     accept_async,
@@ -16,6 +17,18 @@ use tracing::{error, info, warn, debug};
 const TV_WS_URL: &str = "wss://data.tradingview.com/socket.io/websocket?type=chart";
 const TV_ORIGIN: &str = "https://www.tradingview.com";
 const PROXY_ADDR: &str = "127.0.0.1:1080";
+
+// --- 多周期配置 ---
+// (周期名称, TradingView 参数, series 后缀)
+const PERIODS: [(&str, &str, &str); 6] = [
+    ("1m", "1", "s1"),
+    ("5m", "5", "s2"),
+    ("30m", "30", "s3"),
+    ("4h", "240", "s4"),
+    ("1d", "1D", "s5"),
+    ("1w", "1W", "s6"),
+];
+const MAX_CACHE_SIZE: usize = 3000;
 
 // --- 数据结构 ---
 
@@ -177,6 +190,8 @@ pub struct TradingViewProxy {
     broadcast_tx: broadcast::Sender<FrontendMessage>,
     sub_tx: mpsc::Sender<String>,
     sub_rx: Arc<Mutex<mpsc::Receiver<String>>>,
+    /// 多周期缓存: key 格式 "{symbol}_{period}"，例如 "BINANCE:BTCUSDT_1m"
+    cache: Arc<RwLock<HashMap<String, Vec<Kline>>>>,
 }
 
 impl TradingViewProxy {
@@ -187,6 +202,7 @@ impl TradingViewProxy {
             broadcast_tx: tx,
             sub_tx,
             sub_rx: Arc::new(Mutex::new(sub_rx)),
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -204,28 +220,32 @@ impl TradingViewProxy {
         });
     }
 
-    /// [简化版] 每次收到订阅请求，都创建一个新的 TradingView 连接
-    /// 适合个人项目，逻辑最简单
+    /// [多周期版] 每次收到订阅请求，创建一个新的 TradingView 连接订阅 6 个周期
     async fn run_subscription_manager(&self) {
         let mut sub_rx = self.sub_rx.lock().await;
 
         while let Some(symbol) = sub_rx.recv().await {
-            info!("[订阅] 收到请求: {}, 创建新的 TradingView 连接", symbol);
+            info!("[订阅] 收到请求: {}, 创建新的 TradingView 连接 (6 周期)", symbol);
             
             let tx = self.broadcast_tx.clone();
+            let cache = self.cache.clone();
             tokio::spawn(async move {
-                Self::connect_and_stream(symbol, tx).await;
+                Self::connect_and_stream_multi_period(symbol, tx, cache).await;
             });
         }
     }
 
-    /// 建立连接并持续推送数据
-    async fn connect_and_stream(symbol: String, broadcast_tx: broadcast::Sender<FrontendMessage>) {
+    /// 建立连接并订阅 6 个周期，持续推送数据
+    async fn connect_and_stream_multi_period(
+        symbol: String,
+        broadcast_tx: broadcast::Sender<FrontendMessage>,
+        cache: Arc<RwLock<HashMap<String, Vec<Kline>>>>,
+    ) {
         // 只连接一次，获取历史数据后持续推送增量更新
         // 如果连接断开，这个任务就结束（前端会重新发订阅）
         match connect_via_socks5_proxy().await {
             Ok(mut socket) => {
-                info!("[{}] 连接成功，发送订阅请求...", symbol);
+                info!("[{}] 连接成功，发送多周期订阅请求...", symbol);
                 
                 // 认证
                 socket.send(Message::Text(TvProtocol::format_packet(&json!({
@@ -233,27 +253,40 @@ impl TradingViewProxy {
                     "p": ["unauthorized_user_token"]
                 })).into())).await.ok();
 
-                // 创建 session 和订阅
+                // 创建 session
                 let session_id = format!("cs_{}", crate::utils::generate_random_string(12));
-                let series_id = "ser_1";
                 
                 socket.send(Message::Text(TvProtocol::format_packet(&json!({
                     "m": "chart_create_session",
                     "p": [&session_id]
                 })).into())).await.ok();
-                
-                socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                    "m": "resolve_symbol",
-                    "p": [&session_id, series_id, format!("={}", json!({"symbol": &symbol}))]
-                })).into())).await.ok();
 
-                socket.send(Message::Text(TvProtocol::format_packet(&json!({
-                    "m": "create_series",
-                    "p": [&session_id, "$prices", "s1", series_id, "1", 300]
-                })).into())).await.ok();
+                // 为每个周期创建 series
+                for (period_name, tv_timeframe, series_suffix) in PERIODS.iter() {
+                    let series_id = format!("ser_{}", series_suffix);
+                    
+                    // resolve_symbol (共享同一个 symbol)
+                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                        "m": "resolve_symbol",
+                        "p": [&session_id, &series_id, format!("={}", json!({"symbol": &symbol}))]
+                    })).into())).await.ok();
+
+                    // create_series (指定周期)
+                    socket.send(Message::Text(TvProtocol::format_packet(&json!({
+                        "m": "create_series",
+                        "p": [&session_id, format!("$prices_{}", series_suffix), series_suffix, &series_id, tv_timeframe, 300]
+                    })).into())).await.ok();
+                    
+                    info!("[{}] 已订阅周期: {} (series: {})", symbol, period_name, series_suffix);
+                }
+
+                // 每个周期的历史数据发送标记
+                let mut history_sent: HashMap<String, bool> = HashMap::new();
+                for (period_name, _, _) in PERIODS.iter() {
+                    history_sent.insert(period_name.to_string(), false);
+                }
 
                 // 消息循环
-                let mut history_sent = false; // [修复] 标记是否已发送过历史数据
                 while let Some(msg) = socket.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
@@ -263,7 +296,13 @@ impl TradingViewProxy {
                                         socket.send(Message::Text(TvProtocol::format_heartbeat(&num).into())).await.ok();
                                     }
                                     TvPacket::Data(val) => {
-                                        Self::process_tv_data(&symbol, val, &broadcast_tx, &mut history_sent);
+                                        Self::process_tv_data_multi_period(
+                                            &symbol,
+                                            val,
+                                            &broadcast_tx,
+                                            &cache,
+                                            &mut history_sent,
+                                        ).await;
                                     }
                                 }
                             }
@@ -287,57 +326,109 @@ impl TradingViewProxy {
         }
     }
 
-    fn process_tv_data(symbol: &str, val: Value, broadcast_tx: &broadcast::Sender<FrontendMessage>, history_sent: &mut bool) {
+    /// 解析 series 后缀得到周期名称
+    fn series_suffix_to_period(suffix: &str) -> Option<&'static str> {
+        for (period_name, _, series_suffix) in PERIODS.iter() {
+            if *series_suffix == suffix {
+                return Some(period_name);
+            }
+        }
+        None
+    }
+
+    /// 处理多周期数据：解析 series key，写入对应周期缓存
+    async fn process_tv_data_multi_period(
+        symbol: &str,
+        val: Value,
+        broadcast_tx: &broadcast::Sender<FrontendMessage>,
+        cache: &Arc<RwLock<HashMap<String, Vec<Kline>>>>,
+        history_sent: &mut HashMap<String, bool>,
+    ) {
         let m = val.get("m").and_then(|v| v.as_str());
         let p = val.get("p").and_then(|v| v.as_array());
 
         match (m, p) {
             (Some("timescale_update"), Some(p)) if p.len() >= 2 => {
-                if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
-                    // [修复] 只有首次 timescale_update 才作为历史数据发送
-                    // 后续的 timescale_update 转为增量更新处理
-                    if !*history_sent {
-                        // 首次：发送完整历史数据
-                        let mut data = Vec::new();
-                        for item in prices {
-                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                if v.len() >= 6 {
-                                    data.push(Kline {
-                                        time: v[0].as_f64().unwrap_or(0.0) as i64,
-                                        open: v[1].as_f64().unwrap_or(0.0),
-                                        high: v[2].as_f64().unwrap_or(0.0),
-                                        low: v[3].as_f64().unwrap_or(0.0),
-                                        close: v[4].as_f64().unwrap_or(0.0),
-                                        volume: v[5].as_f64().unwrap_or(0.0),
-                                    });
+                // 遍历所有 $prices_sX key
+                if let Some(obj) = p[1].as_object() {
+                    for (key, series_data) in obj.iter() {
+                        // key 格式: "$prices_s1", "$prices_s2", ...
+                        if !key.starts_with("$prices_") {
+                            continue;
+                        }
+                        let suffix = &key[8..]; // 提取 "s1", "s2", ...
+                        let period_name = match Self::series_suffix_to_period(suffix) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let cache_key = format!("{}_{}", symbol, period_name);
+                        
+                        // 解析 K 线数据
+                        if let Some(prices) = series_data.get("s").and_then(|v| v.as_array()) {
+                            let is_first = !*history_sent.get(period_name).unwrap_or(&true);
+                            
+                            if is_first {
+                                // 首次：写入缓存并发送历史数据
+                                let mut data = Vec::new();
+                                for item in prices {
+                                    if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                        if v.len() >= 6 {
+                                            data.push(Kline {
+                                                time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                                open: v[1].as_f64().unwrap_or(0.0),
+                                                high: v[2].as_f64().unwrap_or(0.0),
+                                                low: v[3].as_f64().unwrap_or(0.0),
+                                                close: v[4].as_f64().unwrap_or(0.0),
+                                                volume: v[5].as_f64().unwrap_or(0.0),
+                                            });
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        if !data.is_empty() {
-                            info!("[{}] 发送历史数据: {} 根 K 线", symbol, data.len());
-                            let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
-                                symbol: symbol.to_string(),
-                                data,
-                            }));
-                            *history_sent = true;
-                        }
-                    } else {
-                        // 后续：转为增量更新
-                        for item in prices {
-                            if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                                if v.len() >= 6 {
-                                    let kline = KlineUpdate {
-                                        timestamp: (v[0].as_f64().unwrap_or(0.0) * 1000.0) as i64,
-                                        open: v[1].as_f64().unwrap_or(0.0),
-                                        high: v[2].as_f64().unwrap_or(0.0),
-                                        low: v[3].as_f64().unwrap_or(0.0),
-                                        close: v[4].as_f64().unwrap_or(0.0),
-                                        volume: v[5].as_f64().unwrap_or(0.0),
-                                    };
-                                    let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
-                                        symbol: symbol.to_string(),
-                                        kline,
+                                if !data.is_empty() {
+                                    // 写入缓存
+                                    {
+                                        let mut cache_guard = cache.write().await;
+                                        cache_guard.insert(cache_key.clone(), data.clone());
+                                    }
+                                    
+                                    info!("[{}] 周期 {} 历史数据: {} 根 K 线", symbol, period_name, data.len());
+                                    let _ = broadcast_tx.send(FrontendMessage::History(HistoryPayload {
+                                        symbol: cache_key,
+                                        data,
                                     }));
+                                    history_sent.insert(period_name.to_string(), true);
+                                }
+                            } else {
+                                // 后续：追加到缓存并发送增量更新
+                                for item in prices {
+                                    if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                        if v.len() >= 6 {
+                                            let kline = Kline {
+                                                time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                                open: v[1].as_f64().unwrap_or(0.0),
+                                                high: v[2].as_f64().unwrap_or(0.0),
+                                                low: v[3].as_f64().unwrap_or(0.0),
+                                                close: v[4].as_f64().unwrap_or(0.0),
+                                                volume: v[5].as_f64().unwrap_or(0.0),
+                                            };
+                                            
+                                            // 更新缓存
+                                            Self::update_cache(cache, &cache_key, &kline).await;
+                                            
+                                            let kline_update = KlineUpdate {
+                                                timestamp: kline.time * 1000,
+                                                open: kline.open,
+                                                high: kline.high,
+                                                low: kline.low,
+                                                close: kline.close,
+                                                volume: kline.volume,
+                                            };
+                                            let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                                symbol: cache_key.clone(),
+                                                kline: kline_update,
+                                            }));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -345,29 +436,77 @@ impl TradingViewProxy {
                 }
             }
             (Some("du"), Some(p)) if p.len() >= 2 => {
-                // 增量更新
-                if let Some(prices) = p[1].get("$prices").and_then(|v| v.get("s")).and_then(|v| v.as_array()) {
-                    for item in prices {
-                        if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
-                            if v.len() >= 6 {
-                                let kline = KlineUpdate {
-                                    timestamp: (v[0].as_f64().unwrap_or(0.0) * 1000.0) as i64,
-                                    open: v[1].as_f64().unwrap_or(0.0),
-                                    high: v[2].as_f64().unwrap_or(0.0),
-                                    low: v[3].as_f64().unwrap_or(0.0),
-                                    close: v[4].as_f64().unwrap_or(0.0),
-                                    volume: v[5].as_f64().unwrap_or(0.0),
-                                };
-                                let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
-                                    symbol: symbol.to_string(),
-                                    kline,
-                                }));
+                // 增量更新：遍历所有 $prices_sX key
+                if let Some(obj) = p[1].as_object() {
+                    for (key, series_data) in obj.iter() {
+                        if !key.starts_with("$prices_") {
+                            continue;
+                        }
+                        let suffix = &key[8..];
+                        let period_name = match Self::series_suffix_to_period(suffix) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let cache_key = format!("{}_{}", symbol, period_name);
+                        
+                        if let Some(prices) = series_data.get("s").and_then(|v| v.as_array()) {
+                            for item in prices {
+                                if let Some(v) = item.get("v").and_then(|v| v.as_array()) {
+                                    if v.len() >= 6 {
+                                        let kline = Kline {
+                                            time: v[0].as_f64().unwrap_or(0.0) as i64,
+                                            open: v[1].as_f64().unwrap_or(0.0),
+                                            high: v[2].as_f64().unwrap_or(0.0),
+                                            low: v[3].as_f64().unwrap_or(0.0),
+                                            close: v[4].as_f64().unwrap_or(0.0),
+                                            volume: v[5].as_f64().unwrap_or(0.0),
+                                        };
+                                        
+                                        // 更新缓存
+                                        Self::update_cache(cache, &cache_key, &kline).await;
+                                        
+                                        let kline_update = KlineUpdate {
+                                            timestamp: kline.time * 1000,
+                                            open: kline.open,
+                                            high: kline.high,
+                                            low: kline.low,
+                                            close: kline.close,
+                                            volume: kline.volume,
+                                        };
+                                        let _ = broadcast_tx.send(FrontendMessage::UpdateLast(UpdateLastPayload {
+                                            symbol: cache_key.clone(),
+                                            kline: kline_update,
+                                        }));
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 更新缓存：如果 time 相同则更新最后一根，否则追加新 K 线
+    async fn update_cache(cache: &Arc<RwLock<HashMap<String, Vec<Kline>>>>, cache_key: &str, kline: &Kline) {
+        let mut cache_guard = cache.write().await;
+        let arr = cache_guard.entry(cache_key.to_string()).or_insert_with(Vec::new);
+        
+        if let Some(last) = arr.last_mut() {
+            if last.time == kline.time {
+                // 更新最后一根
+                *last = kline.clone();
+            } else {
+                // 新增一根
+                arr.push(kline.clone());
+                // 限制缓存大小
+                if arr.len() > MAX_CACHE_SIZE {
+                    arr.remove(0);
+                }
+            }
+        } else {
+            arr.push(kline.clone());
         }
     }
 
@@ -379,8 +518,9 @@ impl TradingViewProxy {
         while let Ok((stream, addr)) = listener.accept().await {
             let tx = self.broadcast_tx.clone();
             let sub_tx = self.sub_tx.clone();
+            let cache = self.cache.clone();
             tokio::spawn(async move {
-                handle_frontend_connection(stream, addr, tx, sub_tx).await;
+                handle_frontend_connection(stream, addr, tx, sub_tx, cache).await;
             });
         }
     }
@@ -391,6 +531,7 @@ async fn handle_frontend_connection(
     addr: std::net::SocketAddr,
     broadcast_tx: broadcast::Sender<FrontendMessage>,
     sub_tx: mpsc::Sender<String>,
+    cache: Arc<RwLock<HashMap<String, Vec<Kline>>>>,
 ) {
     info!("前端连接: {}", addr);
     let mut ws_stream = match accept_async(stream).await {
@@ -411,12 +552,38 @@ async fn handle_frontend_connection(
                         info!("收到前端消息 ({}): {}", addr, text);
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if val.is_array() && val[0] == "addSubscriptions" {
+                                // 处理订阅请求
                                 if let Some(symbols) = val[1].get("symbols").and_then(|s| s.as_array()) {
                                     for sym in symbols {
                                         if let Some(s) = sym.as_str() {
                                             let _ = sub_tx.send(s.to_string()).await;
                                         }
                                     }
+                                }
+                            } else if val.is_array() && val[0] == "getHistory" {
+                                // 处理 getHistory RPC：返回缓存中的历史数据
+                                let symbol = val[1].get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let period = val[1].get("period").and_then(|s| s.as_str()).unwrap_or("1m");
+                                let cache_key = format!("{}_{}", symbol, period);
+                                
+                                let cache_guard = cache.read().await;
+                                if let Some(data) = cache_guard.get(&cache_key) {
+                                    info!("[getHistory] 返回 {} 缓存数据: {} 根", cache_key, data.len());
+                                    let msg = FrontendMessage::History(HistoryPayload {
+                                        symbol: cache_key,
+                                        data: data.clone(),
+                                    });
+                                    let binary_msg = build_custom_message(&msg);
+                                    let _ = ws_stream.send(Message::Binary(binary_msg.into())).await;
+                                } else {
+                                    info!("[getHistory] 缓存未命中: {}", cache_key);
+                                    // 返回空数据
+                                    let msg = FrontendMessage::History(HistoryPayload {
+                                        symbol: cache_key,
+                                        data: vec![],
+                                    });
+                                    let binary_msg = build_custom_message(&msg);
+                                    let _ = ws_stream.send(Message::Binary(binary_msg.into())).await;
                                 }
                             }
                         }
