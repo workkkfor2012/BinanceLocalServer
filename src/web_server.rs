@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::models::{DownloadTask, KlineJsonDto};
 use crate::transformer;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, Request},
     http::{header, HeaderMap},
     response::IntoResponse,
     Json,
@@ -80,6 +80,34 @@ pub async fn binary_kline_handler(
     );
 
     Ok((headers, binary_blob))
+}
+
+/// Axum Handler: 代理 /api/account 请求
+pub async fn proxy_account_handler(
+    State(cache_manager): State<Arc<CacheManager>>,
+    req: Request,
+) -> Result<impl IntoResponse> {
+    // 获取原始查询字符串 (包含 signature)
+    let query_string = req.uri().query().unwrap_or("").to_string();
+    let headers = req.headers();
+
+    // 提取需要的 Headers
+    let mut fwd_headers = HeaderMap::new();
+    if let Some(key) = headers.get("X-MBX-APIKEY") {
+        fwd_headers.insert("X-MBX-APIKEY", key.clone());
+    }
+    
+    // 调用 API Client 转发
+    let resp = cache_manager.api_client.forward_account_request(&query_string, fwd_headers).await?;
+    
+    // 返回 JSON
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
+
+    Ok((resp_headers, resp))
 }
 
 // --- 测试端点保持不变，它们不参与两阶段加载逻辑 ---

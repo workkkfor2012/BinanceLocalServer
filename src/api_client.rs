@@ -286,4 +286,44 @@ impl ApiClient {
         info!("🗑️ listenKey 已删除");
         Ok(())
     }
+
+    /// 转发账号请求 (fapi/v2/account)
+    pub async fn forward_account_request(&self, query: &str, headers: HeaderMap) -> Result<String> {
+        // 1. 尝试直连 (Mokex)
+        // 注意：这里我们使用传进来的 query，因为它已经包含了 signature
+        let url = format!("{}/fapi/v2/account?{}", MOKEX_BASE_URL, query);
+        
+        let mut req_builder = self.mokex_client.get(&url);
+        // 转发特定的 Headers (主要是 API Key)
+        for (k, v) in headers.iter() {
+            req_builder = req_builder.header(k, v);
+        }
+
+        match req_builder.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                 let text = resp.text().await?;
+                 debug!("✅ Account info fetched via Direct connection");
+                 return Ok(text);
+            }
+            Ok(resp) => {
+                 warn!("Direct account request failed status: {}", resp.status());
+            }
+            Err(e) => {
+                 warn!("Direct account request failed error: {}", e);
+            }
+        }
+
+        // 2. 尝试代理 (Binance)
+        info!("🔄 尝试通过代理获取账号信息...");
+        let url = format!("{}/fapi/v2/account?{}", BINANCE_BASE_URL, query);
+        let mut req_builder = self.binance_client.get(&url);
+         for (k, v) in headers.iter() {
+             req_builder = req_builder.header(k, v);
+        }
+        
+        let resp = req_builder.send().await?.error_for_status()?;
+        let text = resp.text().await?;
+        debug!("✅ Account info fetched via Proxy");
+        Ok(text)
+    }
 }

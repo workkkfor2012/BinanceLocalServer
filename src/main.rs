@@ -214,6 +214,10 @@ async fn main() {
 
     let app = Router::new()
         .route(
+            "/api/account",
+            get(web_server::proxy_account_handler),
+        )
+        .route(
             "/download/{symbol}/{interval}",
             get(web_server::proxy_kline_handler),
         )
