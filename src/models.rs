@@ -70,7 +70,7 @@ impl From<&Kline> for KlineJsonDto {
             high: k.high.parse::<f64>().unwrap_or(0.0),
             low: k.low.parse::<f64>().unwrap_or(0.0),
             close: k.close.parse::<f64>().unwrap_or(0.0),
-            volume: k.volume.parse::<f64>().unwrap_or(0.0),
+            volume: k.quote_asset_volume.parse::<f64>().unwrap_or(0.0),
         }
     }
 }
