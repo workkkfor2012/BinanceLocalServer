@@ -627,6 +627,7 @@ async fn handle_frontend_message(
 
 use crate::api_client::ApiClient;
 use crate::config::Config;
+use crate::models::{AccountState, DownloadTask, Kline};
 
 /// 私有数据流服务端口
 const USER_DATA_PORT: u16 = 6003;
@@ -641,6 +642,8 @@ pub struct UserDataProxy {
     broadcast_tx: broadcast::Sender<Value>,
     /// 当前 listenKey
     listen_key: Arc<RwLock<Option<String>>>,
+    /// 账户状态缓存
+    state: Arc<RwLock<Option<AccountState>>>,
 }
 
 impl UserDataProxy {
@@ -652,6 +655,7 @@ impl UserDataProxy {
             config,
             broadcast_tx,
             listen_key: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -679,6 +683,22 @@ impl UserDataProxy {
                 Ok(key) => {
                     *self.listen_key.write().await = Some(key.clone());
                     
+                    // 获取初始状态
+                    info!("📥 正在获取账户初始快照...");
+                    match tokio::join!(
+                        self.api_client.get_account_information(),
+                        self.api_client.get_open_orders()
+                    ) {
+                        (Ok(account), Ok(orders)) => {
+                            let new_state = AccountState::from_snapshot(&account, &orders);
+                            *self.state.write().await = Some(new_state);
+                            info!("✅ 账户初始状态已缓存");
+                        },
+                        (Err(e), _) | (_, Err(e)) => {
+                            warn!("⚠️ 获取账户初始快照失败: {}", e);
+                        }
+                    }
+
                     // 启动 WebSocket 连接和续期任务
                     let (ws_result, _) = tokio::join!(
                         self.run_user_data_connection(&key),
@@ -759,6 +779,19 @@ impl UserDataProxy {
                             debug!("📨 收到私有数据: {}", &text[..100.min(text.len())]);
                             
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                                // 更新状态
+                                if let Some(e) = data.get("e").and_then(|s| s.as_str()) {
+                                    if e == "ACCOUNT_UPDATE" {
+                                        if let Some(state) = self.state.write().await.as_mut() {
+                                            state.update_from_account_update(&data);
+                                        }
+                                    } else if e == "ORDER_TRADE_UPDATE" {
+                                        if let Some(state) = self.state.write().await.as_mut() {
+                                            state.update_from_order_update(&data);
+                                        }
+                                    }
+                                }
+
                                 // 广播给所有前端
                                 let _ = self.broadcast_tx.send(data);
                             }
@@ -798,8 +831,9 @@ impl UserDataProxy {
         while let Ok((stream, addr)) = listener.accept().await {
             let broadcast_rx = self.broadcast_tx.subscribe();
             
+            let state = self.state.clone();
             tokio::spawn(async move {
-                handle_user_data_frontend(stream, addr, broadcast_rx).await;
+                handle_user_data_frontend(stream, addr, broadcast_rx, state).await;
             });
         }
     }
@@ -810,6 +844,7 @@ async fn handle_user_data_frontend(
     stream: TcpStream,
     addr: std::net::SocketAddr,
     mut broadcast_rx: broadcast::Receiver<Value>,
+    state: Arc<RwLock<Option<AccountState>>>,
 ) {
     info!("📱 私有数据客户端连接: {}", addr);
     
@@ -822,6 +857,22 @@ async fn handle_user_data_frontend(
     };
     
     let (mut write, mut read) = ws_stream.split();
+    
+    // 发送初始快照
+    {
+        let state_lock = state.read().await;
+        if let Some(s) = state_lock.as_ref() {
+            let snapshot_msg = json!({
+                "e": "ACCOUNT_SNAPSHOT",
+                "data": s
+            });
+            if let Ok(json) = serde_json::to_string(&snapshot_msg) {
+                 if let Err(e) = write.send(Message::Text(json.into())).await {
+                      warn!("发送初始快照失败: {}", e);
+                 }
+            }
+        }
+    }
     
     loop {
         tokio::select! {

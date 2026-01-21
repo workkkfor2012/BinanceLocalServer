@@ -343,4 +343,65 @@ impl ApiClient {
              }
         }
     }
+
+    /// 获取账户信息 (REST API)
+    /// 返回原始 JSON Value
+    pub async fn get_account_information(&self) -> Result<Value> {
+        let config = self.binance_config.as_ref()
+            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let query = format!("timestamp={}&recvWindow=60000", timestamp);
+        let signature = config.sign(&query);
+        let full_query = format!("{}&signature={}", query, signature);
+
+        // 使用 forward_account_request 复用逻辑? 
+        // forward_account_request 是为了转发任意请求设计的，这里我们可以直接利用它的逻辑，
+        // 或者简单点直接调它，但要注意它接收的是 headers。
+        
+        let mut headers = HeaderMap::new();
+        headers.insert("X-MBX-APIKEY", HeaderValue::from_str(&config.api_key).unwrap());
+
+        // 由于 forward_account_request 针对的是 /fapi/v2/account，这里正好复用
+        let json_str = self.forward_account_request(&full_query, headers).await?;
+        let val: Value = serde_json::from_str(&json_str)?;
+        Ok(val)
+    }
+
+    /// 获取当前挂单 (REST API)
+    pub async fn get_open_orders(&self) -> Result<Vec<Value>> {
+        let config = self.binance_config.as_ref()
+            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let query = format!("timestamp={}&recvWindow=60000", timestamp);
+        let signature = config.sign(&query);
+        let full_query = format!("{}&signature={}", query, signature);
+
+        // 这里不能复用 forward_account_request，因为那是硬编码了 /fapi/v2/account
+        // 我们需要类似的逻辑但是针对 /fapi/v1/openOrders
+        
+        // 1. 直连
+        let url = format!("{}/fapi/v1/openOrders?{}", MOKEX_BASE_URL, full_query);
+        let resp = self.mokex_client.get(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send().await;
+
+        if let Ok(r) = resp {
+             if r.status().is_success() {
+                 let val: Vec<Value> = r.json().await?;
+                 return Ok(val);
+             }
+        }
+
+        // 2. 代理
+        let url = format!("{}/fapi/v1/openOrders?{}", BINANCE_BASE_URL, full_query);
+        let resp = self.binance_client.get(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send().await?
+            .error_for_status()?;
+        
+        let val: Vec<Value> = resp.json().await?;
+        Ok(val)
+    }
 }
