@@ -776,9 +776,11 @@ impl UserDataProxy {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            debug!("📨 收到私有数据: {}", &text[..100.min(text.len())]);
-                            
+                            // [调试日志] 收到币安私有数据
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                                let event_type = data.get("e").and_then(|s| s.as_str()).unwrap_or("unknown");
+                                info!("[私有数据流] 收到币安数据: event={}", event_type);
+                                
                                 // 更新状态
                                 if let Some(e) = data.get("e").and_then(|s| s.as_str()) {
                                     if e == "ACCOUNT_UPDATE" {
@@ -866,11 +868,17 @@ async fn handle_user_data_frontend(
                 "e": "ACCOUNT_SNAPSHOT",
                 "data": s
             });
+            // [调试日志] 发送初始快照
+            info!("[私有数据流] 发送初始快照给前端: {}", addr);
             if let Ok(json) = serde_json::to_string(&snapshot_msg) {
                  if let Err(e) = write.send(Message::Text(json.into())).await {
                       warn!("发送初始快照失败: {}", e);
+                 } else {
+                      info!("[私有数据流] 初始快照发送成功");
                  }
             }
+        } else {
+            warn!("[私有数据流] 状态为空，无法发送初始快照");
         }
     }
     
