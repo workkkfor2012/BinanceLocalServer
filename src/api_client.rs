@@ -437,27 +437,55 @@ impl ApiClient {
         // 这里不能复用 forward_account_request，因为那是硬编码了 /fapi/v2/account
         // 我们需要类似的逻辑但是针对 /fapi/v1/openOrders
         
+        info!("📋 正在获取当前挂单...");
+        
         // 1. 直连
         let url = format!("{}/fapi/v1/openOrders?{}", MOKEX_BASE_URL, full_query);
+        debug!("挂单请求 URL (直连): {}", url);
+        
         let resp = self.mokex_client.get(&url)
             .header("X-MBX-APIKEY", &config.api_key)
             .send().await;
 
-        if let Ok(r) = resp {
-             if r.status().is_success() {
-                 let val: Vec<Value> = r.json().await?;
-                 return Ok(val);
-             }
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let val: Vec<Value> = r.json().await?;
+                info!("✅ [直连成功] 获取到 {} 条挂单", val.len());
+                return Ok(val);
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                warn!("⚠️ [直连失败] 挂单请求返回状态码: {}, 响应: {}", status, body);
+            }
+            Err(e) => {
+                warn!("⚠️ [直连失败] 挂单请求错误: {}", e);
+            }
         }
 
         // 2. 代理
+        info!("🔄 挂单请求直连失败，尝试通过代理...");
         let url = format!("{}/fapi/v1/openOrders?{}", BINANCE_BASE_URL, full_query);
-        let resp = self.binance_client.get(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send().await?
-            .error_for_status()?;
         
-        let val: Vec<Value> = resp.json().await?;
-        Ok(val)
+        match self.binance_client.get(&url)
+            .header("X-MBX-APIKEY", &config.api_key)
+            .send().await
+        {
+            Ok(r) if r.status().is_success() => {
+                let val: Vec<Value> = r.json().await?;
+                info!("✅ [代理成功] 获取到 {} 条挂单", val.len());
+                Ok(val)
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                warn!("❌ [代理失败] 挂单请求状态码: {}, 响应: {}", status, body);
+                Err(AppError::ApiLogic(format!("获取挂单失败: {} - {}", status, body)))
+            }
+            Err(e) => {
+                warn!("❌ [代理失败] 挂单请求错误: {}", e);
+                Err(AppError::Reqwest(e))
+            }
+        }
     }
 }
