@@ -6,6 +6,7 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -18,6 +19,14 @@ const BINANCE_BASE_URL: &str = "https://fapi.binance.com";
 const PROXY_URL: &str = "http://127.0.0.1:1080";
 const FALLBACK_RETRIES: u32 = 10;
 const RETRY_DELAY_MS: u64 = 10;
+
+/// 全局时间偏移量（毫秒）：server_time - local_time
+static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
+
+/// 获取与币安服务器同步后的当前毫秒时间戳
+pub fn get_synced_timestamp() -> i64 {
+    chrono::Utc::now().timestamp_millis() + TIME_OFFSET.load(Ordering::Relaxed)
+}
 
 /// listenKey 响应结构
 #[derive(Debug, Deserialize)]
@@ -159,6 +168,53 @@ impl ApiClient {
 
     // ========== listenKey API ==========
 
+    /// 同步币安服务器时间，更新全局偏移量
+    pub async fn sync_server_time(&self) -> Result<()> {
+        debug!("🕒 正在同步币安服务器时间...");
+        let url = format!("{}/fapi/v1/time", MOKEX_BASE_URL);
+        
+        // 1. 尝试通过 Mokex (直连)
+        let resp = self.mokex_client.get(&url).send().await;
+        let server_time = match resp {
+            Ok(r) if r.status().is_success() => {
+                let val: Value = r.json().await?;
+                val["serverTime"].as_i64()
+            }
+            _ => {
+                // 2. 尝试通过 Binance (代理)
+                let url = format!("{}/fapi/v1/time", BINANCE_BASE_URL);
+                let r = self.binance_client.get(&url).send().await?.error_for_status()?;
+                let val: Value = r.json().await?;
+                val["serverTime"].as_i64()
+            }
+        };
+
+        if let Some(st) = server_time {
+            let local_time = chrono::Utc::now().timestamp_millis();
+            let offset = st - local_time;
+            TIME_OFFSET.store(offset, Ordering::Relaxed);
+            info!("✅ 已建立全局时间标准，当前偏移量: {}ms (同步自币安服务器)", offset);
+            Ok(())
+        } else {
+            Err(AppError::ApiLogic("解析服务器时间失败".to_string()))
+        }
+    }
+
+    /// 开启定时同步任务，每小时执行一次
+    pub fn spawn_sync_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.sync_server_time().await {
+                    warn!("❌ 定时同步服务器时间失败: {}", e);
+                }
+            }
+        });
+    }
+
+    // ========== listenKey API ==========
+
     /// 创建 listenKey
     pub async fn post_listen_key(&self) -> Result<String> {
         let config = self.binance_config.as_ref()
@@ -167,7 +223,7 @@ impl ApiClient {
         info!("📡 正在获取 listenKey...");
         
         // 构建签名参数
-        let timestamp = chrono::Utc::now().timestamp_millis();
+        let timestamp = get_synced_timestamp();
         let query = format!("timestamp={}&recvWindow=60000", timestamp);
         let signature = config.sign(&query);
         let full_query = format!("{}&signature={}", query, signature);
@@ -221,7 +277,7 @@ impl ApiClient {
         
         debug!("🔄 正在续期 listenKey...");
         
-        let timestamp = chrono::Utc::now().timestamp_millis();
+        let timestamp = get_synced_timestamp();
         let query = format!("timestamp={}&recvWindow=60000", timestamp);
         let signature = config.sign(&query);
         let full_query = format!("{}&signature={}", query, signature);
@@ -270,7 +326,7 @@ impl ApiClient {
         
         debug!("🗑️ 正在删除 listenKey...");
         
-        let timestamp = chrono::Utc::now().timestamp_millis();
+        let timestamp = get_synced_timestamp();
         let query = format!("timestamp={}&recvWindow=60000", timestamp);
         let signature = config.sign(&query);
         let full_query = format!("{}&signature={}", query, signature);
@@ -350,7 +406,7 @@ impl ApiClient {
         let config = self.binance_config.as_ref()
             .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
 
-        let timestamp = chrono::Utc::now().timestamp_millis();
+        let timestamp = get_synced_timestamp();
         let query = format!("timestamp={}&recvWindow=60000", timestamp);
         let signature = config.sign(&query);
         let full_query = format!("{}&signature={}", query, signature);
@@ -373,7 +429,7 @@ impl ApiClient {
         let config = self.binance_config.as_ref()
             .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
 
-        let timestamp = chrono::Utc::now().timestamp_millis();
+        let timestamp = get_synced_timestamp();
         let query = format!("timestamp={}&recvWindow=60000", timestamp);
         let signature = config.sign(&query);
         let full_query = format!("{}&signature={}", query, signature);

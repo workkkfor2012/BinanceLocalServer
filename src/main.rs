@@ -149,7 +149,9 @@ async fn main() {
 
     // --- 1. 初始化依赖 (无变化) ---
     let api_client = Arc::new(ApiClient::new().expect("Failed to create API clients"));
-    info!("API 客户端已初始化。");
+    api_client.clone().sync_server_time().await.expect("Failed to sync server time");
+    api_client.clone().spawn_sync_loop();
+    info!("API 客户端及全局时间同步已初始化。");
 
     let db_manager = Arc::new(DbManager::new().await.expect("Failed to initialize DbManager"));
     info!("数据库管理器已初始化。");
@@ -183,6 +185,8 @@ async fn main() {
         match api_client::ApiClient::new_with_config(config.binance.clone()) {
             Ok(private_client) => {
                 let private_client = Arc::new(private_client);
+                private_client.clone().sync_server_time().await.ok(); // 私有客户端也尝试同步一下（可选）
+                private_client.clone().spawn_sync_loop();
                 let user_data_proxy = Arc::new(binance_proxy::UserDataProxy::new(
                     private_client,
                     config.clone(),
