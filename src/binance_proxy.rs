@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 // --- 常量配置 ---
 
 /// 直连端点（无需翻墙，但有订阅密度限制）
-const DIRECT_WS_URL: &str = "wss://fstream.mokexapp.info/ws";
+const DIRECT_WS_URL: &str = "wss://fstream.mokexapp.org/ws";
 /// 代理端点（需要翻墙，无订阅限制）
 const PROXY_WS_URL: &str = "wss://fstream.binance.com/ws";
 /// SOCKS5 代理地址

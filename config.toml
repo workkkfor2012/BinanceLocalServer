@@ -7,8 +7,8 @@ api_key = "kWImFoYo5zv7r2cNcHGSDAXdnI41Y5r4DWwocL405xBFQNZjqaIuD83cNpWeB958"
 api_secret = "gbsH85HUBVeGwTW8YfjrTEj7VZg8LqyqPg2TmMp3Xz7bWLLLYYmBDAS8esbuaMR2"
 
 # 直连端点（无需翻墙，国内可用）
-direct_rest_base = "https://www.mokexapp.info"
-direct_ws_base = "wss://fstream.mokexapp.info"
+direct_rest_base = "https://www.mokexapp.org"
+direct_ws_base = "wss://fstream.mokexapp.org"
 
 # 代理端点（需要翻墙）
 proxy_rest_base = "https://fapi.binance.com"

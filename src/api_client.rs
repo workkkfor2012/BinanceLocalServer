@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, instrument, trace, warn};
 
 // Constants
-const MOKEX_BASE_URL: &str = "https://www.mokexapp.info";
+const MOKEX_BASE_URL: &str = "https://www.mokexapp.org";
 const BINANCE_BASE_URL: &str = "https://fapi.binance.com";
 const PROXY_URL: &str = "http://127.0.0.1:1080";
 const FALLBACK_RETRIES: u32 = 10;
