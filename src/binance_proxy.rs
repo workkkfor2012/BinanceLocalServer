@@ -8,9 +8,9 @@
 //! 4. 广播行情数据给所有前端客户端
 
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -38,6 +38,12 @@ const LOCAL_SERVER_PORT: u16 = 6002;
 const CONNECTION_LIFETIME_SECS: u64 = 23 * 3600; // 23小时，留出缓冲
 /// 广播通道容量
 const BROADCAST_CAPACITY: usize = 10000;
+/// 断线期间待发送消息队列容量（超出会丢弃最旧消息）
+const PENDING_MSG_CAPACITY: usize = 5000;
+/// 重连最小退避秒数
+const RECONNECT_BACKOFF_MIN_SECS: u64 = 1;
+/// 重连最大退避秒数
+const RECONNECT_BACKOFF_MAX_SECS: u64 = 30;
 
 // --- 数据结构 ---
 
@@ -172,6 +178,8 @@ pub struct BinanceProxy {
     client_id_counter: Arc<std::sync::atomic::AtomicU64>,
     /// 向币安发送消息的通道
     binance_tx: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    /// 断线期间待发送到币安的消息
+    pending_messages: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl BinanceProxy {
@@ -186,6 +194,7 @@ impl BinanceProxy {
             state: Arc::new(RwLock::new(SubscriptionState::default())),
             client_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             binance_tx: Arc::new(Mutex::new(None)),
+            pending_messages: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
     
@@ -285,23 +294,146 @@ impl BinanceProxy {
     
     /// 向币安发送订阅/取消订阅请求
     async fn send_to_binance(&self, method: &str, streams: &[String]) {
-        let binance_tx = self.binance_tx.lock().await;
-        if let Some(tx) = binance_tx.as_ref() {
-            let msg = json!({
-                "method": method,
-                "params": streams,
-                "id": rand::random::<u32>()
-            });
-            if let Err(e) = tx.send(msg.to_string()).await {
-                warn!("发送消息到币安失败: {}", e);
+        let msg = json!({
+            "method": method,
+            "params": streams,
+            "id": rand::random::<u32>()
+        })
+        .to_string();
+
+        let tx = {
+            let guard = self.binance_tx.lock().await;
+            guard.as_ref().cloned()
+        };
+
+        if let Some(tx) = tx {
+            if let Err(e) = tx.send(msg.clone()).await {
+                warn!("发送消息到币安失败，将消息入队等待重连: {}", e);
+                self.enqueue_pending_message(msg).await;
             }
         } else {
-            warn!("币安连接尚未建立，消息将在重连后重试");
+            self.enqueue_pending_message(msg).await;
+            warn!("币安连接尚未建立，消息已入队，重连后恢复");
+        }
+    }
+
+    async fn enqueue_pending_message(&self, msg: String) {
+        let mut pending = self.pending_messages.lock().await;
+        if pending.len() >= PENDING_MSG_CAPACITY {
+            pending.pop_front();
+            warn!("断线待发送队列已满，已丢弃最旧消息");
+        }
+        pending.push_back(msg);
+    }
+
+    fn parse_stream_delta(msg: &str) -> Option<(String, Vec<String>)> {
+        let value: Value = serde_json::from_str(msg).ok()?;
+        let method = value.get("method")?.as_str()?.to_string();
+        let streams = value
+            .get("params")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some((method, streams))
+    }
+
+    async fn flush_pending_messages(
+        &self,
+        tx: &mpsc::Sender<String>,
+    ) -> HashSet<String> {
+        let pending = {
+            let mut queue = self.pending_messages.lock().await;
+            queue.drain(..).collect::<Vec<_>>()
+        };
+
+        let mut simulated_remote_subscriptions = HashSet::new();
+        if pending.is_empty() {
+            return simulated_remote_subscriptions;
+        }
+
+        for msg in &pending {
+            if let Some((method, streams)) = Self::parse_stream_delta(msg) {
+                match method.as_str() {
+                    "SUBSCRIBE" => {
+                        for stream in streams {
+                            simulated_remote_subscriptions.insert(stream);
+                        }
+                    }
+                    "UNSUBSCRIBE" => {
+                        for stream in streams {
+                            simulated_remote_subscriptions.remove(&stream);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        info!("♻️ 重放 {} 条断线期间积压消息...", pending.len());
+        for (idx, msg) in pending.iter().enumerate() {
+            if tx.send(msg.clone()).await.is_err() {
+                warn!(
+                    "积压消息重放中断，剩余 {} 条消息重新入队",
+                    pending.len().saturating_sub(idx)
+                );
+                let mut queue = self.pending_messages.lock().await;
+                for rest in pending.iter().skip(idx) {
+                    if queue.len() >= PENDING_MSG_CAPACITY {
+                        queue.pop_front();
+                    }
+                    queue.push_back(rest.clone());
+                }
+                return HashSet::new();
+            }
+        }
+
+        simulated_remote_subscriptions
+    }
+
+    async fn restore_subscriptions_after_reconnect(
+        &self,
+        replayed_subscriptions: &HashSet<String>,
+    ) {
+        let streams = {
+            let state = self.state.read().await;
+            state.all_streams()
+        };
+
+        if streams.is_empty() && replayed_subscriptions.is_empty() {
+            return;
+        }
+
+        if !streams.is_empty() {
+            info!("🔄 恢复 {} 个订阅...", streams.len());
+            for chunk in streams.chunks(200) {
+                self.send_to_binance("SUBSCRIBE", chunk).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        // 新连接初始无订阅。若重放消息形成了“当前状态不需要”的订阅，这里主动清理。
+        let target_set: HashSet<String> = streams.iter().cloned().collect();
+        let stale_streams: Vec<String> = replayed_subscriptions
+            .difference(&target_set)
+            .cloned()
+            .collect();
+        if !stale_streams.is_empty() {
+            info!("🧹 清理 {} 个过期订阅...", stale_streams.len());
+            for chunk in stale_streams.chunks(200) {
+                self.send_to_binance("UNSUBSCRIBE", chunk).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
     
     /// 币安连接管理器：维护与币安的连接
     async fn run_binance_connection(&self) {
+        let mut reconnect_backoff = Duration::from_secs(RECONNECT_BACKOFF_MIN_SECS);
+
         loop {
             let connection_start = Instant::now();
             
@@ -309,35 +441,24 @@ impl BinanceProxy {
             match self.try_connect().await {
                 Ok((ws_stream, endpoint)) => {
                     info!("✅ 已连接到币安: {}", endpoint);
-                    
-                    // 恢复订阅
-                    let streams = {
-                        let state = self.state.read().await;
-                        state.all_streams()
-                    };
-                    if !streams.is_empty() {
-                        info!("🔄 恢复 {} 个订阅...", streams.len());
-                        // 分批发送订阅，避免单次请求过大
-                        for chunk in streams.chunks(200) {
-                            let msg = json!({
-                                "method": "SUBSCRIBE",
-                                "params": chunk,
-                                "id": rand::random::<u32>()
-                            });
-                            // 稍后通过 binance_tx 发送
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            if let Some(tx) = self.binance_tx.lock().await.as_ref() {
-                                let _ = tx.send(msg.to_string()).await;
-                            }
-                        }
-                    }
+                    reconnect_backoff = Duration::from_secs(RECONNECT_BACKOFF_MIN_SECS);
                     
                     // 运行连接维护循环
                     self.run_binance_loop(ws_stream, connection_start).await;
                 }
                 Err(e) => {
-                    error!("❌ 连接币安失败: {}，5秒后重试...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    error!(
+                        "❌ 连接币安失败: {}，{}秒后重试...",
+                        e,
+                        reconnect_backoff.as_secs()
+                    );
+                    tokio::time::sleep(reconnect_backoff).await;
+                    let next_secs = reconnect_backoff
+                        .as_secs()
+                        .saturating_mul(2)
+                        .min(RECONNECT_BACKOFF_MAX_SECS);
+                    reconnect_backoff =
+                        Duration::from_secs(next_secs.max(RECONNECT_BACKOFF_MIN_SECS));
                 }
             }
         }
@@ -358,7 +479,22 @@ impl BinanceProxy {
         
         // 直连失败，使用代理
         info!("🔗 通过代理连接币安 ({})...", PROXY_WS_URL);
-        let ws = connect_via_socks5_proxy(PROXY_WS_URL, SOCKS5_PROXY).await?;
+        let ws = match tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_via_socks5_proxy(PROXY_WS_URL, SOCKS5_PROXY),
+        )
+        .await
+        {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "SOCKS5 代理连接超时",
+                )
+                .into())
+            }
+        };
         Ok((ws, "代理"))
     }
     
@@ -373,6 +509,19 @@ impl BinanceProxy {
         // 创建向币安发送消息的通道
         let (tx, mut rx) = mpsc::channel::<String>(1000);
         *self.binance_tx.lock().await = Some(tx);
+
+        // 注意：binance_tx 建立后再恢复订阅，避免“恢复消息发送到空通道”的竞态。
+        let tx_for_flush = {
+            let guard = self.binance_tx.lock().await;
+            guard.as_ref().cloned()
+        };
+        let replayed_subscriptions = if let Some(active_tx) = tx_for_flush.as_ref() {
+            self.flush_pending_messages(active_tx).await
+        } else {
+            HashSet::new()
+        };
+        self.restore_subscriptions_after_reconnect(&replayed_subscriptions)
+            .await;
         
         // 定时器：检查连接生命周期
         let mut lifetime_check = interval(Duration::from_secs(300));
@@ -416,8 +565,9 @@ impl BinanceProxy {
                 
                 // 发送消息到币安
                 Some(msg) = rx.recv() => {
-                    if let Err(e) = write.send(Message::Text(msg.into())).await {
+                    if let Err(e) = write.send(Message::Text(msg.clone().into())).await {
                         error!("发送消息到币安失败: {}", e);
+                        self.enqueue_pending_message(msg).await;
                         break;
                     }
                 }
@@ -627,7 +777,7 @@ async fn handle_frontend_message(
 
 use crate::api_client::ApiClient;
 use crate::config::Config;
-use crate::models::{AccountState, DownloadTask, Kline};
+use crate::models::AccountState;
 
 /// 私有数据流服务端口
 const USER_DATA_PORT: u16 = 6003;
