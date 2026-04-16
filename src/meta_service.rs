@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs, sync::RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const DEFAULT_DOWNLOAD_PROXY_URL: &str = "http://127.0.0.1:17892";
 const DEFAULT_GATEWAY_CONTRACTS_URL: &str = "http://127.0.0.1:40000/api/contracts";
@@ -28,8 +28,6 @@ const MAX_TOP_TURNOVER_LIMIT: usize = 50;
 const TOP_TURNOVER_CANDIDATE_MULTIPLIER: usize = 4;
 const TOP_TURNOVER_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
 const TOP_TURNOVER_VALIDATION_KLINE_LIMIT: usize = 12;
-const MIN_TOP_TURNOVER_SYMBOL_LEN: usize = 5;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalContractInfo {
@@ -162,15 +160,43 @@ impl MetaService {
             .map_err(AppError::Reqwest)?
             .into_iter()
             .filter_map(|item| {
-                let symbol = normalize_symbol(&item.symbol);
+                let raw_symbol = item.symbol.trim();
+                let symbol = normalize_symbol(raw_symbol);
                 let quote_volume = item.quote_volume.parse::<f64>().ok()?;
                 let last_price = item.last_price.parse::<f64>().unwrap_or(0.0);
                 let price_change_percent = item.price_change_percent.parse::<f64>().unwrap_or(0.0);
 
-                if !is_valid_top_turnover_symbol(&symbol) || quote_volume <= 0.0 {
-                    if !symbol.is_empty() {
-                        warn!("skip invalid top-turnover ticker symbol: {}", symbol);
-                    }
+                if raw_symbol.is_empty() {
+                    error!("top-turnover ticker returned empty symbol");
+                    return None;
+                }
+
+                if symbol != raw_symbol.to_ascii_uppercase() {
+                    error!(
+                        "top-turnover ticker returned malformed symbol: raw_symbol={} normalized_symbol={} quote_volume={} close_time={}",
+                        raw_symbol,
+                        symbol,
+                        quote_volume,
+                        item.close_time
+                    );
+                    return None;
+                }
+
+                if quote_volume <= 0.0 {
+                    return None;
+                }
+
+                if symbol == "USDT" {
+                    error!(
+                        "top-turnover ticker returned unexpected bare quote asset symbol: raw_symbol={} quote_volume={} close_time={}",
+                        raw_symbol,
+                        quote_volume,
+                        item.close_time
+                    );
+                    return None;
+                }
+
+                if !symbol.ends_with("USDT") {
                     return None;
                 }
 
@@ -470,10 +496,6 @@ fn normalize_symbol(symbol: &str) -> String {
         .filter(|char| char.is_ascii_alphanumeric() || *char == '_' || *char == '-')
         .collect::<String>()
         .to_ascii_uppercase()
-}
-
-fn is_valid_top_turnover_symbol(symbol: &str) -> bool {
-    symbol.len() >= MIN_TOP_TURNOVER_SYMBOL_LEN && symbol.ends_with("USDT")
 }
 
 fn now_ms() -> i64 {
