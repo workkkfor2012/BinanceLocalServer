@@ -6,8 +6,8 @@ use tokio_rusqlite::{params, Connection};
 use tracing::info; // <- 移除了未使用的 `warn`
 
 const DB_PATH: &str = "kline_cache.db";
-const PRUNE_TRIGGER_COUNT: i64 = 3000;
-const PRUNE_KEEP_COUNT: i64 = 1500;
+const PRUNE_TRIGGER_COUNT: i64 = 6000;
+const PRUNE_KEEP_COUNT: i64 = 3000;
 
 #[derive(Clone)]
 pub struct DbManager {
@@ -18,12 +18,13 @@ impl DbManager {
     pub async fn new() -> Result<Self> {
         let conn = Connection::open(DB_PATH).await?;
         info!("🗄️ Database connection opened at '{}'", DB_PATH);
-        
+
         conn.call(|conn| {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             Ok(())
-        }).await?;
+        })
+        .await?;
         info!("🗄️ WAL mode enabled for SQLite.");
 
         conn.call(|conn| {
@@ -48,25 +49,32 @@ impl DbManager {
                 [],
             )?;
             Ok(())
-        }).await?;
+        })
+        .await?;
         info!("🗄️ 'klines' table initialized.");
 
         Ok(Self { conn })
     }
 
     // --- 【已修复编译错误】 ---
-    pub async fn delete_klines_for_symbol_interval(&self, symbol: &str, interval: &str) -> Result<()> {
+    pub async fn delete_klines_for_symbol_interval(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> Result<()> {
         let symbol = symbol.to_string();
         let interval = interval.to_string();
 
-        self.conn.call(move |conn| {
-            let deleted_rows = conn.execute(
-                "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2",
-                params![symbol, interval],
-            )?;
-            Ok(())
-        }).await?;
-        
+        self.conn
+            .call(move |conn| {
+                let _deleted_rows = conn.execute(
+                    "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2",
+                    params![symbol, interval],
+                )?;
+                Ok(())
+            })
+            .await?;
+
         Ok(())
     }
 
@@ -114,11 +122,11 @@ impl DbManager {
                 Ok(())
             })
             .await?;
-        
+
         self.prune_klines_if_needed(symbol, interval).await?;
         Ok(())
     }
-    
+
     async fn prune_klines_if_needed(&self, symbol: &str, interval: &str) -> Result<()> {
         let symbol = symbol.to_string();
         let interval = interval.to_string();
@@ -131,7 +139,7 @@ impl DbManager {
             )?;
 
             if count > PRUNE_TRIGGER_COUNT {
-                let deleted_rows = conn.execute(
+                let _deleted_rows = conn.execute(
                     "DELETE FROM klines WHERE symbol = ?1 AND interval = ?2 AND open_time IN (
                         SELECT open_time FROM klines WHERE symbol = ?1 AND interval = ?2 ORDER BY open_time ASC LIMIT ?3
                     )",
@@ -182,6 +190,7 @@ impl DbManager {
         Ok(klines)
     }
 
+    #[allow(dead_code)]
     pub async fn get_db_summary(&self) -> Result<HashMap<String, Vec<(String, i64)>>> {
         let summary_data = self
             .conn
@@ -205,18 +214,21 @@ impl DbManager {
         Ok(summary_data)
     }
 
+    #[allow(dead_code)]
     pub async fn get_all_cache_keys(&self) -> Result<Vec<(String, String)>> {
-        let keys = self.conn.call(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT DISTINCT symbol, interval FROM klines",
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut result_keys = Vec::new();
-            while let Some(row) = rows.next()? {
-                result_keys.push((row.get(0)?, row.get(1)?));
-            }
-            Ok(result_keys)
-        }).await?;
+        let keys = self
+            .conn
+            .call(|conn| {
+                let mut stmt =
+                    conn.prepare_cached("SELECT DISTINCT symbol, interval FROM klines")?;
+                let mut rows = stmt.query([])?;
+                let mut result_keys = Vec::new();
+                while let Some(row) = rows.next()? {
+                    result_keys.push((row.get(0)?, row.get(1)?));
+                }
+                Ok(result_keys)
+            })
+            .await?;
         Ok(keys)
     }
 }

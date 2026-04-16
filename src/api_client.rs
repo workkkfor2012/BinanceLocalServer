@@ -1,142 +1,300 @@
-// src/api_client.rs
 use crate::config::BinanceConfig;
 use crate::error::{AppError, Result};
 use crate::models::{DownloadTask, Kline};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, trace, warn};
 
-// Constants
-const MOKEX_BASE_URL: &str = "https://www.mokexapp.org";
 const BINANCE_BASE_URL: &str = "https://fapi.binance.com";
-const PROXY_URL: &str = "http://127.0.0.1:1080";
+const DEFAULT_DOWNLOAD_PROXY_URL: &str = "http://127.0.0.1:17892";
+const DEFAULT_NON_DOWNLOAD_PROXY_URL: &str = "socks5h://127.0.0.1:1080";
 const FALLBACK_RETRIES: u32 = 10;
 const RETRY_DELAY_MS: u64 = 10;
+const BINANCE_MAX_KLINE_LIMIT: usize = 1000;
 
-/// 全局时间偏移量（毫秒）：server_time - local_time
 static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
-
-/// 获取与币安服务器同步后的当前毫秒时间戳
-pub fn get_synced_timestamp() -> i64 {
-    chrono::Utc::now().timestamp_millis() + TIME_OFFSET.load(Ordering::Relaxed)
-}
-
-/// listenKey 响应结构
-#[derive(Debug, Deserialize)]
-pub struct ListenKeyResponse {
-    #[serde(rename = "listenKey")]
-    pub listen_key: String,
-}
 
 #[derive(Clone)]
 pub struct ApiClient {
-    mokex_client: Arc<Client>,
-    binance_client: Arc<Client>,
-    /// 币安配置（可选，用于私有 API）
-    binance_config: Option<Arc<BinanceConfig>>,
+    download_client: Arc<Client>,
+    rest_client: Arc<Client>,
 }
 
 impl ApiClient {
-    pub fn new() -> Result<Self> {
-        let mut mokex_headers = HeaderMap::new();
-        mokex_headers.insert(
+    fn build_clients(
+        download_proxy_url: &str,
+        non_download_proxy_url: &str,
+    ) -> Result<(Client, Client)> {
+        let mut download_headers = HeaderMap::new();
+        download_headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Binance/1.54.19 Chrome/128.0.6613.186 Electron/32.3.0 Safari/537.36 (electron 1.54.19)")
+            HeaderValue::from_static(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Binance/1.54.19 Chrome/128.0.6613.186 Electron/32.3.0 Safari/537.36 (electron 1.54.19)",
+            ),
         );
-        mokex_headers.insert(
+        download_headers.insert(
             "mclient-x-tag",
             HeaderValue::from_static("tfph2mpTPAuwxbiMHoQc"),
         );
 
-        let mokex_client = Client::builder()
-            .default_headers(mokex_headers)
+        let download_client = Client::builder()
+            .default_headers(download_headers)
+            .proxy(reqwest::Proxy::all(download_proxy_url).map_err(AppError::Reqwest)?)
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(AppError::Reqwest)?;
 
-        let proxy = reqwest::Proxy::all(PROXY_URL).map_err(AppError::Reqwest)?;
-        let binance_client = Client::builder()
-            .proxy(proxy)
+        let rest_client = Client::builder()
+            .proxy(reqwest::Proxy::all(non_download_proxy_url).map_err(AppError::Reqwest)?)
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(AppError::Reqwest)?;
+
+        Ok((download_client, rest_client))
+    }
+
+    fn new_internal(download_proxy_url: &str, non_download_proxy_url: &str) -> Result<Self> {
+        let (download_client, rest_client) =
+            Self::build_clients(download_proxy_url, non_download_proxy_url)?;
 
         Ok(Self {
-            mokex_client: Arc::new(mokex_client),
-            binance_client: Arc::new(binance_client),
-            binance_config: None,
+            download_client: Arc::new(download_client),
+            rest_client: Arc::new(rest_client),
         })
     }
 
-    /// 创建带 API Key 配置的客户端
-    pub fn new_with_config(config: BinanceConfig) -> Result<Self> {
-        let mut client = Self::new()?;
-        client.binance_config = Some(Arc::new(config));
-        Ok(client)
+    pub fn new() -> Result<Self> {
+        Self::new_internal(DEFAULT_DOWNLOAD_PROXY_URL, DEFAULT_NON_DOWNLOAD_PROXY_URL)
     }
 
-    /// 获取配置
-    pub fn config(&self) -> Option<&BinanceConfig> {
-        self.binance_config.as_ref().map(|c| c.as_ref())
+    pub fn new_public_with_config(config: &BinanceConfig) -> Result<Self> {
+        let non_download_proxy_url = config.non_download_rest_proxy_url();
+        Self::new_internal(config.download_proxy_url(), &non_download_proxy_url)
     }
 
-    /// 使用 fallback 和 retry 逻辑下载K线
     #[instrument(skip(self))]
     pub async fn download_continuous_klines(&self, task: &DownloadTask) -> Result<Vec<Kline>> {
-        let start_time = Instant::now();
+        let interval_ms = interval_to_milliseconds(&task.interval)?;
+        let request_limit = task.limit.max(1);
 
-        // 1. 首先尝试 Mokex
-        let mokex_result = self
-            .fetch_klines(&self.mokex_client, MOKEX_BASE_URL, task)
-            .await;
+        if request_limit <= BINANCE_MAX_KLINE_LIMIT {
+            return self.download_klines_once(task).await;
+        }
 
-        match mokex_result {
-            Ok(klines) => {
-                Ok(klines)
-            }
-            Err(e) => {
-                let mut last_error: Option<AppError> = None;
-
-                for attempt in 1..=FALLBACK_RETRIES {
-
-                    match self
-                        .fetch_klines(&self.binance_client, BINANCE_BASE_URL, task)
-                        .await
-                    {
-                        Ok(klines) => {
-                            return Ok(klines);
-                        }
-                        Err(retry_err) => {
-                            last_error = Some(retry_err);
-
-                            if attempt < FALLBACK_RETRIES {
-                                sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-                            }
-                        }
-                    }
-                }
-
-                Err(last_error.unwrap())
-            }
+        if task.start_time.is_some() {
+            self.download_klines_forward_chunked(task, interval_ms).await
+        } else {
+            self.download_klines_backward_chunked(task, interval_ms).await
         }
     }
 
-    /// 实际执行API请求的私有方法
+    async fn download_klines_once(&self, task: &DownloadTask) -> Result<Vec<Kline>> {
+        let mut last_error: Option<AppError> = None;
+
+        for attempt in 1..=FALLBACK_RETRIES {
+            match self
+                .fetch_klines(&self.download_client, BINANCE_BASE_URL, task)
+                .await
+            {
+                Ok(klines) => return Ok(klines),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < FALLBACK_RETRIES {
+                        sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            AppError::ApiLogic(format!(
+                "failed to download klines for symbol={} interval={}",
+                task.symbol, task.interval
+            ))
+        }))
+    }
+
+    async fn download_klines_forward_chunked(
+        &self,
+        task: &DownloadTask,
+        interval_ms: i64,
+    ) -> Result<Vec<Kline>> {
+        let mut collected: Vec<Kline> = Vec::new();
+        let mut next_start_time = task.start_time;
+        let end_time = task.end_time;
+
+        while collected.len() < task.limit {
+            let remaining = task.limit - collected.len();
+            let chunk_limit = remaining.min(BINANCE_MAX_KLINE_LIMIT);
+            let chunk_task = DownloadTask {
+                symbol: task.symbol.clone(),
+                interval: task.interval.clone(),
+                start_time: next_start_time,
+                end_time,
+                limit: chunk_limit,
+            };
+            let mut chunk = self.download_klines_once(&chunk_task).await?;
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            if let Some(last_collected) = collected.last() {
+                if let Some(first_chunk) = chunk.first() {
+                    if first_chunk.open_time == last_collected.open_time {
+                        chunk.remove(0);
+                    }
+                }
+            }
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            next_start_time = chunk
+                .last()
+                .map(|kline| kline.open_time.saturating_add(interval_ms));
+            let fetched_len = chunk.len();
+            collected.extend(chunk);
+
+            if fetched_len < chunk_limit {
+                break;
+            }
+
+            if let (Some(next_start), Some(chunk_end)) = (next_start_time, end_time) {
+                if next_start > chunk_end {
+                    break;
+                }
+            }
+        }
+
+        if collected.len() > task.limit {
+            let overflow = collected.len() - task.limit;
+            collected.drain(..overflow);
+        }
+
+        Ok(collected)
+    }
+
+    async fn download_klines_backward_chunked(
+        &self,
+        task: &DownloadTask,
+        interval_ms: i64,
+    ) -> Result<Vec<Kline>> {
+        let mut collected: Vec<Kline> = Vec::new();
+        let mut next_end_time = task.end_time;
+
+        while collected.len() < task.limit {
+            let remaining = task.limit - collected.len();
+            let chunk_limit = remaining.min(BINANCE_MAX_KLINE_LIMIT);
+            let chunk_task = DownloadTask {
+                symbol: task.symbol.clone(),
+                interval: task.interval.clone(),
+                start_time: None,
+                end_time: next_end_time,
+                limit: chunk_limit,
+            };
+            let mut chunk = self.download_klines_once(&chunk_task).await?;
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            if let Some(first_existing) = collected.first() {
+                if let Some(last_chunk) = chunk.last() {
+                    if last_chunk.open_time == first_existing.open_time {
+                        chunk.pop();
+                    }
+                }
+            }
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            let fetched_len = chunk.len();
+            next_end_time = chunk
+                .first()
+                .map(|kline| kline.open_time.saturating_sub(interval_ms));
+            chunk.extend(collected);
+            collected = chunk;
+
+            if fetched_len < chunk_limit {
+                break;
+            }
+        }
+
+        if collected.len() > task.limit {
+            let overflow = collected.len() - task.limit;
+            collected.drain(..overflow);
+        }
+
+        Ok(collected)
+    }
+
     async fn fetch_klines(
         &self,
         client: &Client,
         base_url: &str,
         task: &DownloadTask,
     ) -> Result<Vec<Kline>> {
+        let mut attempts = Vec::with_capacity(3);
+        attempts.push((
+            "symbol_klines",
+            self.fetch_symbol_klines(client, base_url, task).await,
+        ));
+        attempts.push((
+            "continuous_perpetual",
+            self.fetch_continuous_klines(client, base_url, task, "PERPETUAL")
+                .await,
+        ));
+        attempts.push((
+            "continuous_tradifi",
+            self.fetch_continuous_klines(client, base_url, task, "TRADIFI_PERPETUAL")
+                .await,
+        ));
+
+        let mut last_error = None;
+        for (strategy, result) in attempts {
+            match result {
+                Ok(klines) => {
+                    debug!(
+                        "kline fetch succeeded via {} symbol={} interval={}",
+                        strategy, task.symbol, task.interval
+                    );
+                    return Ok(klines);
+                }
+                Err(err) => {
+                    debug!(
+                        "kline fetch failed via {} symbol={} interval={} err={}",
+                        strategy, task.symbol, task.interval, err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            AppError::ApiLogic(format!(
+                "no kline strategy succeeded for symbol={} interval={}",
+                task.symbol, task.interval
+            ))
+        }))
+    }
+
+    async fn fetch_symbol_klines(
+        &self,
+        client: &Client,
+        base_url: &str,
+        task: &DownloadTask,
+    ) -> Result<Vec<Kline>> {
         let mut url_params = format!(
-            "pair={}&contractType=PERPETUAL&interval={}&limit={}",
+            "symbol={}&interval={}&limit={}",
             task.symbol, task.interval, task.limit
         );
         if let Some(start_time) = task.start_time {
@@ -146,346 +304,114 @@ impl ApiClient {
             url_params.push_str(&format!("&endTime={}", end_time));
         }
 
+        let url = format!("{}/fapi/v1/klines?{}", base_url, url_params);
+        self.fetch_klines_from_url(client, &url, task).await
+    }
+
+    async fn fetch_continuous_klines(
+        &self,
+        client: &Client,
+        base_url: &str,
+        task: &DownloadTask,
+        contract_type: &str,
+    ) -> Result<Vec<Kline>> {
+        let mut url_params = format!(
+            "pair={}&contractType={}&interval={}&limit={}",
+            task.symbol, contract_type, task.interval, task.limit
+        );
+        if let Some(start_time) = task.start_time {
+            url_params.push_str(&format!("&startTime={}", start_time));
+        }
+        if let Some(end_time) = task.end_time {
+            url_params.push_str(&format!("&endTime={}", end_time));
+        }
+
         let url = format!("{}/fapi/v1/continuousKlines?{}", base_url, url_params);
+        self.fetch_klines_from_url(client, &url, task).await
+    }
 
-        let response = client.get(&url).send().await?.error_for_status()?;
+    async fn fetch_klines_from_url(
+        &self,
+        client: &Client,
+        url: &str,
+        task: &DownloadTask,
+    ) -> Result<Vec<Kline>> {
+        let response = client.get(url).send().await?.error_for_status()?;
         let response_text = response.text().await?;
-
         let raw_klines: Vec<Vec<Value>> = serde_json::from_str(&response_text)?;
 
         if raw_klines.is_empty() {
-            trace!("API returned empty result for task: {:?}", task);
+            trace!(
+                "API returned empty result for task: {:?}, url={}",
+                task,
+                url
+            );
             return Ok(vec![]);
         }
 
-        let klines = raw_klines
+        Ok(raw_klines
             .iter()
             .filter_map(|raw_kline_vec| Kline::from_raw_kline(raw_kline_vec))
-            .collect::<Vec<Kline>>();
-
-        Ok(klines)
+            .collect())
     }
 
-    // ========== listenKey API ==========
-
-    /// 同步币安服务器时间，更新全局偏移量
     pub async fn sync_server_time(&self) -> Result<()> {
-        debug!("🕒 正在同步币安服务器时间...");
-        let url = format!("{}/fapi/v1/time", MOKEX_BASE_URL);
-        
-        // 1. 尝试通过 Mokex (直连)
-        let resp = self.mokex_client.get(&url).send().await;
-        let server_time = match resp {
-            Ok(r) if r.status().is_success() => {
-                let val: Value = r.json().await?;
-                val["serverTime"].as_i64()
-            }
-            _ => {
-                // 2. 尝试通过 Binance (代理)
-                let url = format!("{}/fapi/v1/time", BINANCE_BASE_URL);
-                let r = self.binance_client.get(&url).send().await?.error_for_status()?;
-                let val: Value = r.json().await?;
-                val["serverTime"].as_i64()
-            }
-        };
+        debug!("syncing server time through proxy");
+        let url = format!("{}/fapi/v1/time", BINANCE_BASE_URL);
+        let val: Value = self
+            .rest_client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
 
-        if let Some(st) = server_time {
-            let local_time = chrono::Utc::now().timestamp_millis();
-            let offset = st - local_time;
-            TIME_OFFSET.store(offset, Ordering::Relaxed);
-            info!("✅ 已建立全局时间标准，当前偏移量: {}ms (同步自币安服务器)", offset);
-            Ok(())
-        } else {
-            Err(AppError::ApiLogic("解析服务器时间失败".to_string()))
-        }
+        let server_time = val["serverTime"]
+            .as_i64()
+            .ok_or_else(|| AppError::ApiLogic("missing serverTime".to_string()))?;
+        let local_time = chrono::Utc::now().timestamp_millis();
+        let offset = server_time - local_time;
+        TIME_OFFSET.store(offset, Ordering::Relaxed);
+        info!("server time synced, offset={}ms", offset);
+        Ok(())
     }
 
-    /// 开启定时同步任务，每小时执行一次
     pub fn spawn_sync_loop(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 if let Err(e) = self.sync_server_time().await {
-                    warn!("❌ 定时同步服务器时间失败: {}", e);
+                    warn!("failed to sync server time: {}", e);
                 }
             }
         });
     }
+}
 
-    // ========== listenKey API ==========
+fn interval_to_milliseconds(interval: &str) -> Result<i64> {
+    let unit = interval
+        .chars()
+        .last()
+        .ok_or_else(|| AppError::ApiLogic(format!("invalid interval: {}", interval)))?;
+    let value = interval[..interval.len().saturating_sub(1)]
+        .parse::<i64>()
+        .map_err(|_| AppError::ApiLogic(format!("invalid interval value: {}", interval)))?;
 
-    /// 创建 listenKey
-    pub async fn post_listen_key(&self) -> Result<String> {
-        let config = self.binance_config.as_ref()
-            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
-        
-        info!("📡 正在获取 listenKey...");
-        
-        // 构建签名参数
-        let timestamp = get_synced_timestamp();
-        let query = format!("timestamp={}&recvWindow=60000", timestamp);
-        let signature = config.sign(&query);
-        let full_query = format!("{}&signature={}", query, signature);
-        
-        // 首先尝试直连
-        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
-        debug!("listenKey URL: {}", url);
-        
-        let response = self.mokex_client
-            .post(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send()
-            .await;
-        
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                let data: ListenKeyResponse = resp.json().await?;
-                info!("✅ listenKey 获取成功: {}...", &data.listen_key[..16.min(data.listen_key.len())]);
-                return Ok(data.listen_key);
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("直连获取 listenKey 失败: {} - {}", status, body);
-            }
-            Err(e) => {
-                warn!("直连获取 listenKey 失败: {}", e);
-            }
+    let millis = match unit {
+        's' => value * 1_000,
+        'm' => value * 60 * 1_000,
+        'h' => value * 60 * 60 * 1_000,
+        'd' => value * 24 * 60 * 60 * 1_000,
+        'w' => value * 7 * 24 * 60 * 60 * 1_000,
+        _ => {
+            return Err(AppError::ApiLogic(format!(
+                "unsupported interval unit: {}",
+                interval
+            )))
         }
-        
-        // 回退到代理
-        info!("🔄 尝试通过代理获取 listenKey...");
-        let url = format!("{}/fapi/v1/listenKey?{}", config.proxy_rest_base, full_query);
-        
-        let response = self.binance_client
-            .post(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
-        
-        let data: ListenKeyResponse = response.json().await?;
-        info!("✅ listenKey 通过代理获取成功: {}...", &data.listen_key[..16.min(data.listen_key.len())]);
-        Ok(data.listen_key)
-    }
+    };
 
-    /// 续期 listenKey
-    pub async fn put_listen_key(&self) -> Result<()> {
-        let config = self.binance_config.as_ref()
-            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
-        
-        debug!("🔄 正在续期 listenKey...");
-        
-        let timestamp = get_synced_timestamp();
-        let query = format!("timestamp={}&recvWindow=60000", timestamp);
-        let signature = config.sign(&query);
-        let full_query = format!("{}&signature={}", query, signature);
-        
-        // 首先尝试直连
-        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
-        
-        let response = self.mokex_client
-            .put(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send()
-            .await;
-        
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                info!("✅ listenKey 续期成功");
-                return Ok(());
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                warn!("直连续期 listenKey 失败: {}", status);
-            }
-            Err(e) => {
-                warn!("直连续期 listenKey 失败: {}", e);
-            }
-        }
-        
-        // 回退到代理
-        let url = format!("{}/fapi/v1/listenKey?{}", config.proxy_rest_base, full_query);
-        
-        self.binance_client
-            .put(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
-        
-        info!("✅ listenKey 通过代理续期成功");
-        Ok(())
-    }
-
-    /// 删除 listenKey
-    pub async fn delete_listen_key(&self) -> Result<()> {
-        let config = self.binance_config.as_ref()
-            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
-        
-        debug!("🗑️ 正在删除 listenKey...");
-        
-        let timestamp = get_synced_timestamp();
-        let query = format!("timestamp={}&recvWindow=60000", timestamp);
-        let signature = config.sign(&query);
-        let full_query = format!("{}&signature={}", query, signature);
-        
-        let url = format!("{}/fapi/v1/listenKey?{}", config.direct_rest_base, full_query);
-        
-        let _ = self.mokex_client
-            .delete(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send()
-            .await;
-        
-        info!("🗑️ listenKey 已删除");
-        Ok(())
-    }
-
-    /// 转发账号请求 (fapi/v2/account)
-    pub async fn forward_account_request(&self, query: &str, headers: HeaderMap) -> Result<String> {
-        info!("▶️ 开始处理账号信息请求转发");
-        
-        // 1. 尝试直连 (Mokex)
-        // 注意：这里我们使用传进来的 query，因为它已经包含了 signature
-        let url = format!("{}/fapi/v2/account?{}", MOKEX_BASE_URL, query);
-        debug!("尝试通过直连地址: {}", url);
-        
-        let mut req_builder = self.mokex_client.get(&url);
-        // 转发特定的 Headers (主要是 API Key)
-        for (k, v) in headers.iter() {
-            req_builder = req_builder.header(k, v);
-        }
-
-        match req_builder.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                 let text = resp.text().await?;
-                 info!("✅ [直连成功] 已通过 Mokex 获取账号信息");
-                 return Ok(text);
-            }
-            Ok(resp) => {
-                 warn!("⚠️ [直连失败] Mokex 返回状态码: {}", resp.status());
-            }
-            Err(e) => {
-                 warn!("⚠️ [直连失败] 请求错误: {}", e);
-            }
-        }
-
-        // 2. 尝试代理 (Binance)
-        info!("🔄 直连失败，尝试切换到代理通道 (Binance)...");
-        let url = format!("{}/fapi/v2/account?{}", BINANCE_BASE_URL, query);
-        let mut req_builder = self.binance_client.get(&url);
-         for (k, v) in headers.iter() {
-             req_builder = req_builder.header(k, v);
-        }
-        
-        match req_builder.send().await {
-             Ok(resp) => {
-                 let status = resp.status();
-                 if status.is_success() {
-                     let text = resp.text().await?;
-                     info!("✅ [代理成功] 已通过 Binance 代理获取账号信息");
-                     Ok(text)
-                 } else {
-                     let err_text = resp.text().await.unwrap_or_default();
-                     warn!("❌ [代理失败] Binance 返回状态码: {}, 响应: {}", status, err_text);
-                     Err(AppError::ApiLogic(format!("Binance Proxy Error: Status {}, Body: {}", status, err_text)))
-                 }
-             }
-             Err(e) => {
-                 warn!("❌ [代理失败] 请求错误: {}", e);
-                 Err(AppError::Reqwest(e))
-             }
-        }
-    }
-
-    /// 获取账户信息 (REST API)
-    /// 返回原始 JSON Value
-    pub async fn get_account_information(&self) -> Result<Value> {
-        let config = self.binance_config.as_ref()
-            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
-
-        let timestamp = get_synced_timestamp();
-        let query = format!("timestamp={}&recvWindow=60000", timestamp);
-        let signature = config.sign(&query);
-        let full_query = format!("{}&signature={}", query, signature);
-
-        // 使用 forward_account_request 复用逻辑? 
-        // forward_account_request 是为了转发任意请求设计的，这里我们可以直接利用它的逻辑，
-        // 或者简单点直接调它，但要注意它接收的是 headers。
-        
-        let mut headers = HeaderMap::new();
-        headers.insert("X-MBX-APIKEY", HeaderValue::from_str(&config.api_key).unwrap());
-
-        // 由于 forward_account_request 针对的是 /fapi/v2/account，这里正好复用
-        let json_str = self.forward_account_request(&full_query, headers).await?;
-        let val: Value = serde_json::from_str(&json_str)?;
-        Ok(val)
-    }
-
-    /// 获取当前挂单 (REST API)
-    pub async fn get_open_orders(&self) -> Result<Vec<Value>> {
-        let config = self.binance_config.as_ref()
-            .ok_or_else(|| AppError::Config("API Key 未配置".to_string()))?;
-
-        let timestamp = get_synced_timestamp();
-        let query = format!("timestamp={}&recvWindow=60000", timestamp);
-        let signature = config.sign(&query);
-        let full_query = format!("{}&signature={}", query, signature);
-
-        // 这里不能复用 forward_account_request，因为那是硬编码了 /fapi/v2/account
-        // 我们需要类似的逻辑但是针对 /fapi/v1/openOrders
-        
-        info!("📋 正在获取当前挂单...");
-        
-        // 1. 直连
-        let url = format!("{}/fapi/v1/openOrders?{}", MOKEX_BASE_URL, full_query);
-        debug!("挂单请求 URL (直连): {}", url);
-        
-        let resp = self.mokex_client.get(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send().await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let val: Vec<Value> = r.json().await?;
-                info!("✅ [直连成功] 获取到 {} 条挂单", val.len());
-                return Ok(val);
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                warn!("⚠️ [直连失败] 挂单请求返回状态码: {}, 响应: {}", status, body);
-            }
-            Err(e) => {
-                warn!("⚠️ [直连失败] 挂单请求错误: {}", e);
-            }
-        }
-
-        // 2. 代理
-        info!("🔄 挂单请求直连失败，尝试通过代理...");
-        let url = format!("{}/fapi/v1/openOrders?{}", BINANCE_BASE_URL, full_query);
-        
-        match self.binance_client.get(&url)
-            .header("X-MBX-APIKEY", &config.api_key)
-            .send().await
-        {
-            Ok(r) if r.status().is_success() => {
-                let val: Vec<Value> = r.json().await?;
-                info!("✅ [代理成功] 获取到 {} 条挂单", val.len());
-                Ok(val)
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                warn!("❌ [代理失败] 挂单请求状态码: {}, 响应: {}", status, body);
-                Err(AppError::ApiLogic(format!("获取挂单失败: {} - {}", status, body)))
-            }
-            Err(e) => {
-                warn!("❌ [代理失败] 挂单请求错误: {}", e);
-                Err(AppError::Reqwest(e))
-            }
-        }
-    }
+    Ok(millis)
 }
