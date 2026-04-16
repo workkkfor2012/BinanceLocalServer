@@ -28,6 +28,7 @@ const MAX_TOP_TURNOVER_LIMIT: usize = 50;
 const TOP_TURNOVER_CANDIDATE_MULTIPLIER: usize = 4;
 const TOP_TURNOVER_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
 const TOP_TURNOVER_VALIDATION_KLINE_LIMIT: usize = 12;
+const MIN_TOP_TURNOVER_SYMBOL_LEN: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,7 +167,10 @@ impl MetaService {
                 let last_price = item.last_price.parse::<f64>().unwrap_or(0.0);
                 let price_change_percent = item.price_change_percent.parse::<f64>().unwrap_or(0.0);
 
-                if !symbol.ends_with("USDT") || quote_volume <= 0.0 {
+                if !is_valid_top_turnover_symbol(&symbol) || quote_volume <= 0.0 {
+                    if !symbol.is_empty() {
+                        warn!("skip invalid top-turnover ticker symbol: {}", symbol);
+                    }
                     return None;
                 }
 
@@ -195,16 +199,22 @@ impl MetaService {
         let mut items = Vec::with_capacity(requested_limit);
 
         for candidate in candidates.into_iter().take(candidate_limit) {
-            if self
-                .has_recent_positive_turnover(&candidate.symbol)
-                .await?
-            {
-                items.push(candidate);
-            } else {
-                warn!(
-                    "skip zero-turnover top-turnover candidate: symbol={}",
-                    candidate.symbol
-                );
+            match self.has_recent_positive_turnover(&candidate.symbol).await {
+                Ok(true) => {
+                    items.push(candidate);
+                }
+                Ok(false) => {
+                    warn!(
+                        "skip zero-turnover top-turnover candidate: symbol={}",
+                        candidate.symbol
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        "skip top-turnover candidate on validation error: symbol={} err={}",
+                        candidate.symbol, error
+                    );
+                }
             }
 
             if items.len() >= requested_limit {
@@ -460,6 +470,10 @@ fn normalize_symbol(symbol: &str) -> String {
         .filter(|char| char.is_ascii_alphanumeric() || *char == '_' || *char == '-')
         .collect::<String>()
         .to_ascii_uppercase()
+}
+
+fn is_valid_top_turnover_symbol(symbol: &str) -> bool {
+    symbol.len() >= MIN_TOP_TURNOVER_SYMBOL_LEN && symbol.ends_with("USDT")
 }
 
 fn now_ms() -> i64 {
