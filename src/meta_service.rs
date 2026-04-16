@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{fs, sync::RwLock};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const DEFAULT_DOWNLOAD_PROXY_URL: &str = "http://127.0.0.1:17892";
 const DEFAULT_GATEWAY_CONTRACTS_URL: &str = "http://127.0.0.1:40000/api/contracts";
@@ -160,39 +160,16 @@ impl MetaService {
             .map_err(AppError::Reqwest)?
             .into_iter()
             .filter_map(|item| {
-                let raw_symbol = item.symbol.trim();
-                let symbol = normalize_symbol(raw_symbol);
+                let symbol = item.symbol.trim().to_string();
                 let quote_volume = item.quote_volume.parse::<f64>().ok()?;
                 let last_price = item.last_price.parse::<f64>().unwrap_or(0.0);
                 let price_change_percent = item.price_change_percent.parse::<f64>().unwrap_or(0.0);
 
-                if raw_symbol.is_empty() {
-                    error!("top-turnover ticker returned empty symbol");
-                    return None;
-                }
-
-                if symbol != raw_symbol.to_ascii_uppercase() {
-                    error!(
-                        "top-turnover ticker returned malformed symbol: raw_symbol={} normalized_symbol={} quote_volume={} close_time={}",
-                        raw_symbol,
-                        symbol,
-                        quote_volume,
-                        item.close_time
-                    );
+                if symbol.is_empty() {
                     return None;
                 }
 
                 if quote_volume <= 0.0 {
-                    return None;
-                }
-
-                if symbol == "USDT" {
-                    error!(
-                        "top-turnover ticker returned unexpected bare quote asset symbol: raw_symbol={} quote_volume={} close_time={}",
-                        raw_symbol,
-                        quote_volume,
-                        item.close_time
-                    );
                     return None;
                 }
 
