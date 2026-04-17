@@ -1,75 +1,66 @@
-// src/config.rs
-//! 配置管理模块
-//!
-//! 从 config.toml 加载应用配置，包括 API 密钥和端点设置。
-
+use crate::utils::resolve_runtime_base_dir;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use tracing::{info, warn};
 
-/// 应用配置
+const DEFAULT_DOWNLOAD_PROXY_URL: &str = "http://127.0.0.1:17892";
+const DEFAULT_WS_PROXY_ADDR: &str = "127.0.0.1:1080";
+const DEFAULT_REST_SOCKS5H_PROXY_URL: &str = "socks5h://127.0.0.1:1080";
+const DEFAULT_PROXY_REST_BASE: &str = "https://fapi.binance.com";
+const DEFAULT_PROXY_WS_BASE: &str = "wss://fstream.binance.com";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub binance: BinanceConfig,
 }
 
-/// 币安相关配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct BinanceConfig {
-    /// API Key
-    pub api_key: String,
-    /// API Secret
-    pub api_secret: String,
-    /// 直连 REST API 地址
-    pub direct_rest_base: String,
-    /// 直连 WebSocket 地址
-    pub direct_ws_base: String,
-    /// 代理 REST API 地址
-    pub proxy_rest_base: String,
-    /// 代理 WebSocket 地址
-    pub proxy_ws_base: String,
-    /// SOCKS5 代理地址
-    pub socks5_proxy: String,
+    pub proxy_rest_base: Option<String>,
+    pub proxy_ws_base: Option<String>,
+    pub rest_proxy_url: Option<String>,
+    pub ws_socks5_proxy: Option<String>,
+    pub socks5_proxy: Option<String>,
 }
 
 impl Config {
-    /// 从配置文件加载配置
     pub fn load() -> Option<Self> {
-        let config_path = Path::new("config.toml");
-        
+        let base_dir = resolve_runtime_base_dir();
+        let config_path_buf = base_dir.join("config.toml");
+        let config_path = Path::new(&config_path_buf);
         if !config_path.exists() {
-            warn!("⚠️ 配置文件 config.toml 不存在，私有数据流功能将被禁用");
+            warn!(
+                "config.toml not found at {}, using built-in proxy defaults",
+                config_path.display()
+            );
             return None;
         }
-        
+
         match fs::read_to_string(config_path) {
-            Ok(content) => {
-                match toml::from_str::<Config>(&content) {
-                    Ok(config) => {
-                        // 检查 API Key 是否已配置
-                        if config.binance.api_key == "YOUR_API_KEY_HERE" 
-                            || config.binance.api_key.is_empty() 
-                        {
-                            warn!("⚠️ API Key 未配置，私有数据流功能将被禁用");
-                            return None;
-                        }
-                        
-                        info!("✅ 配置文件加载成功");
-                        info!("  - 直连 REST: {}", config.binance.direct_rest_base);
-                        info!("  - 代理 REST: {}", config.binance.proxy_rest_base);
-                        info!("  - API Key: {}...", &config.binance.api_key[..8.min(config.binance.api_key.len())]);
-                        
-                        Some(config)
-                    }
-                    Err(e) => {
-                        warn!("❌ 配置文件解析失败: {}", e);
-                        None
-                    }
+            Ok(content) => match toml::from_str::<Config>(&content) {
+                Ok(config) => {
+                    info!("config.toml loaded from {}", config_path.display());
+                    info!(
+                        "  - download proxy: {}",
+                        config.binance.download_proxy_url()
+                    );
+                    info!(
+                        "  - rest proxy: {}",
+                        config.binance.non_download_rest_proxy_url()
+                    );
+                    info!("  - ws proxy: {}", config.binance.ws_proxy_addr());
+                    info!("  - upstream rest: {}", config.binance.proxy_rest_base());
+                    info!("  - upstream ws: {}", config.binance.proxy_public_ws_url());
+                    Some(config)
                 }
-            }
+                Err(e) => {
+                    warn!("failed to parse config.toml: {}", e);
+                    None
+                }
+            },
             Err(e) => {
-                warn!("❌ 读取配置文件失败: {}", e);
+                warn!("failed to read config.toml: {}", e);
                 None
             }
         }
@@ -77,17 +68,56 @@ impl Config {
 }
 
 impl BinanceConfig {
-    /// 生成 HMAC-SHA256 签名
-    pub fn sign(&self, message: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        
-        type HmacSha256 = Hmac<Sha256>;
-        
-        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
-            .expect("HMAC can take key of any size");
-        mac.update(message.as_bytes());
-        
-        hex::encode(mac.finalize().into_bytes())
+    pub fn download_proxy_url(&self) -> &str {
+        self.rest_proxy_url
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_DOWNLOAD_PROXY_URL)
+    }
+
+    pub fn non_download_rest_proxy_url(&self) -> String {
+        if let Some(addr) = self
+            .ws_socks5_proxy
+            .as_deref()
+            .or(self.socks5_proxy.as_deref())
+        {
+            if addr.contains("://") {
+                if addr.starts_with("socks5h://") {
+                    return addr.to_string();
+                }
+                if addr.starts_with("socks5://") {
+                    return addr.replacen("socks5://", "socks5h://", 1);
+                }
+                return addr.to_string();
+            }
+            return format!("socks5h://{}", addr);
+        }
+
+        DEFAULT_REST_SOCKS5H_PROXY_URL.to_string()
+    }
+
+    pub fn ws_proxy_addr(&self) -> &str {
+        self.ws_socks5_proxy
+            .as_deref()
+            .or(self.socks5_proxy.as_deref())
+            .unwrap_or(DEFAULT_WS_PROXY_ADDR)
+    }
+
+    pub fn proxy_rest_base(&self) -> &str {
+        self.proxy_rest_base
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_PROXY_REST_BASE)
+    }
+
+    pub fn proxy_public_ws_url(&self) -> String {
+        format!(
+            "{}/ws",
+            self.proxy_ws_base
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_PROXY_WS_BASE)
+                .trim_end_matches('/')
+        )
     }
 }

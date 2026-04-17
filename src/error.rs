@@ -19,9 +19,6 @@ pub enum AppError {
     #[error("Database error: {0}")]
     Database(#[from] tokio_rusqlite::Error),
 
-    #[error("Config error: {0}")]
-    Config(String),
-
     #[error("API logic error: {0}")]
     ApiLogic(String),
 }

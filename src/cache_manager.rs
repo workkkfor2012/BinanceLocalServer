@@ -44,14 +44,8 @@ impl CacheManager {
                     .await
             }
             _ => {
-                self.get_klines_with_update(
-                    symbol,
-                    interval,
-                    start_time,
-                    end_time,
-                    requested_limit,
-                )
-                .await
+                self.get_klines_with_update(symbol, interval, start_time, end_time, requested_limit)
+                    .await
             }
         }
     }
@@ -62,7 +56,9 @@ impl CacheManager {
         interval: &str,
         limit: usize,
     ) -> Result<Vec<Kline>> {
-        self.db_manager.get_latest_klines(symbol, interval, limit).await
+        self.db_manager
+            .get_latest_klines(symbol, interval, limit)
+            .await
     }
 
     async fn get_klines_with_update(
@@ -78,7 +74,8 @@ impl CacheManager {
             .get_latest_klines(symbol, interval, requested_limit)
             .await?;
 
-        let mut start_time = requested_start_time.or_else(|| klines_from_db.last().map(|k| k.open_time));
+        let mut start_time =
+            requested_start_time.or_else(|| klines_from_db.last().map(|k| k.open_time));
 
         if let Some(last_open_time) = start_time {
             if let Ok(interval_ms) = utils::interval_to_milliseconds(interval) {

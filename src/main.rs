@@ -195,6 +195,8 @@ async fn main() {
     let meta_service = Arc::new(
         MetaService::new(runtime_config.as_deref()).expect("failed to initialize MetaService"),
     );
+    meta_service.warm_caches().await;
+    meta_service.clone().spawn_background_refresh();
     let news_service = Arc::new(
         NewsService::new(runtime_config.as_deref()).expect("failed to initialize NewsService"),
     );
@@ -287,8 +289,20 @@ async fn main() {
         )
         .merge(
             Router::new()
+                .route(
+                    "/api/exchange-info",
+                    get(meta_service::exchange_info_handler),
+                )
+                .route("/api/contracts", get(meta_service::contracts_handler))
+                .route(
+                    "/api/contracts/{symbol}",
+                    get(meta_service::contract_handler),
+                )
                 .route("/meta/contracts", get(meta_service::contracts_handler))
-                .route("/meta/top-turnover", get(meta_service::top_turnover_handler))
+                .route(
+                    "/meta/top-turnover",
+                    get(meta_service::top_turnover_handler),
+                )
                 .route("/meta/icon/{symbol}", get(meta_service::icon_handler))
                 .with_state(meta_service),
         )

@@ -18,7 +18,6 @@ const RECORD_BODY_SIZE: usize = 32 + KLINE_DATA_BUFFER_SIZE;
 // 全局头部 (8) + 记录体 (144040) = 144048
 const TOTAL_BLOB_SIZE: usize = 8 + RECORD_BODY_SIZE;
 
-
 /// 【已更新】将字符串形式的时间间隔映射到规范要求的 periodIndex
 // ... (函数内容不变)
 fn interval_to_period_index(interval: &str) -> Result<i32> {
@@ -38,11 +37,7 @@ fn interval_to_period_index(interval: &str) -> Result<i32> {
 }
 
 /// 将获取到的 K 线数据转换为前端需要的二进制 blob
-pub fn klines_to_binary_blob(
-    klines: &[Kline],
-    symbol: &str,
-    interval: &str,
-) -> Result<Vec<u8>> {
+pub fn klines_to_binary_blob(klines: &[Kline], symbol: &str, interval: &str) -> Result<Vec<u8>> {
     // 1. 初始化一个固定大小、填满0的字节缓冲区
     let mut buffer = vec![0u8; TOTAL_BLOB_SIZE];
     let mut writer = Cursor::new(&mut buffer[..]);
@@ -72,7 +67,10 @@ pub fn klines_to_binary_blob(
 
     for (i, kline) in klines.iter().enumerate() {
         if i >= MAX_KLINE_RECORDS {
-            warn!("More than {} klines provided, truncating.", MAX_KLINE_RECORDS);
+            warn!(
+                "More than {} klines provided, truncating.",
+                MAX_KLINE_RECORDS
+            );
             break;
         }
 
@@ -87,15 +85,23 @@ pub fn klines_to_binary_blob(
 
         // --- 【核心修正】按照前端 CycleArray 排序后的字段顺序写入 ---
         // 排序后: close, ext_多空比, ext_持仓量, ext_资金费率, high, low, open, timestamp, 成交额
-        data_body_slice[0 * FIELD_BLOCK_SIZE + offset..0 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&close.to_le_bytes());
-        data_body_slice[1 * FIELD_BLOCK_SIZE + offset..1 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&zero_f64.to_le_bytes());
-        data_body_slice[2 * FIELD_BLOCK_SIZE + offset..2 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&zero_f64.to_le_bytes());
-        data_body_slice[3 * FIELD_BLOCK_SIZE + offset..3 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&zero_f64.to_le_bytes());
-        data_body_slice[4 * FIELD_BLOCK_SIZE + offset..4 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&high.to_le_bytes());
-        data_body_slice[5 * FIELD_BLOCK_SIZE + offset..5 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&low.to_le_bytes());
-        data_body_slice[6 * FIELD_BLOCK_SIZE + offset..6 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&open.to_le_bytes());
-        data_body_slice[7 * FIELD_BLOCK_SIZE + offset..7 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&kline.open_time.to_le_bytes());
-        data_body_slice[8 * FIELD_BLOCK_SIZE + offset..8 * FIELD_BLOCK_SIZE + offset + 8].copy_from_slice(&quote_volume.to_le_bytes());
+        data_body_slice[offset..offset + 8].copy_from_slice(&close.to_le_bytes());
+        data_body_slice[FIELD_BLOCK_SIZE + offset..FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&zero_f64.to_le_bytes());
+        data_body_slice[2 * FIELD_BLOCK_SIZE + offset..2 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&zero_f64.to_le_bytes());
+        data_body_slice[3 * FIELD_BLOCK_SIZE + offset..3 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&zero_f64.to_le_bytes());
+        data_body_slice[4 * FIELD_BLOCK_SIZE + offset..4 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&high.to_le_bytes());
+        data_body_slice[5 * FIELD_BLOCK_SIZE + offset..5 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&low.to_le_bytes());
+        data_body_slice[6 * FIELD_BLOCK_SIZE + offset..6 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&open.to_le_bytes());
+        data_body_slice[7 * FIELD_BLOCK_SIZE + offset..7 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&kline.open_time.to_le_bytes());
+        data_body_slice[8 * FIELD_BLOCK_SIZE + offset..8 * FIELD_BLOCK_SIZE + offset + 8]
+            .copy_from_slice(&quote_volume.to_le_bytes());
     }
 
     Ok(buffer)

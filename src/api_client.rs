@@ -87,9 +87,11 @@ impl ApiClient {
         }
 
         if task.start_time.is_some() {
-            self.download_klines_forward_chunked(task, interval_ms).await
+            self.download_klines_forward_chunked(task, interval_ms)
+                .await
         } else {
-            self.download_klines_backward_chunked(task, interval_ms).await
+            self.download_klines_backward_chunked(task, interval_ms)
+                .await
         }
     }
 
